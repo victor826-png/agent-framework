@@ -65,13 +65,14 @@ def main() -> int:
         errors.append(f"cannot read README {readme_path}: {exc}")
         readme = ""
 
+    tick = chr(96)
     readme_entries = []
     for line in readme.splitlines():
         cells = line.split("|")
         if len(cells) < 2:
             continue
         cell = cells[1].strip()
-        if len(cell) >= 2 and cell.startswith("`") and cell.endswith("`"):
+        if len(cell) >= 2 and cell.startswith(tick) and cell.endswith(tick):
             readme_entries.append(cell[1:-1])
 
     if readme_entries != directories:
@@ -80,7 +81,7 @@ def main() -> int:
             f"(README={readme_entries!r}, manifest={directories!r})"
         )
 
-    if "pytorch" in directories or "`pytorch`" in readme:
+    if "pytorch" in directories or (tick + "pytorch" + tick) in readme:
         errors.append("removed PyTorch snapshot must not appear in the current directory inventory")
 
     if errors:
