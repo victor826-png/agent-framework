@@ -1,0 +1,76 @@
+name: Deploy documentation
+
+on:
+  push:
+    branches: main
+
+# Allow the deploy job to publish to GitHub Pages via OIDC (no branch, no stored credentials).
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: ${{ github.ref }}-${{ github.head_ref }}-docs
+  cancel-in-progress: true
+
+# Pinned to ubuntu-24.04, as in CI.yml.
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install packages
+        uses: ./.github/actions/apt-install
+        with:
+          packages: doxygen graphviz texlive texlive-latex-extra latexmk poppler-utils
+      - name: Install Sphinx
+        run: python3 -m pip install sphinx==9.1.1 sphinx_rtd_theme sphinxcontrib-bibtex
+
+      - name: Build doxygen
+        working-directory: ${{ github.workspace }}/Docs
+        run: |
+          doxygen doxygen.conf
+
+      - name: Build documentation figures
+        working-directory: ${{ github.workspace }}
+        run: |
+          Scripts/build-doc-figures.sh
+
+      - name: Build HTML documentation
+        working-directory: ${{ github.workspace }}/Docs/Sphinx
+        run: |
+          make html
+
+      - name: Build PDF documentation
+        working-directory: ${{ github.workspace }}/Docs/Sphinx
+        run: |
+          make latexpdf
+
+      - name: Cleanup
+        working-directory: ${{ github.workspace }}/Docs
+        run: |
+          cp -a Sphinx/build/html/* ./
+          mv Sphinx/build/latex/ebgeometry.pdf ./
+          rm -rf Sphinx/build
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: Docs
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

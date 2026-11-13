@@ -1,0 +1,987 @@
+#include "MyTest.H"
+
+#include <AMReX_GMRES.H>
+#include <AMReX_GMRES_MLMG.H>
+#include <AMReX_MLNodeABecLaplacian.H>
+#include <AMReX_MLABecLaplacian.H>
+#include <AMReX_MLPoisson.H>
+#include <AMReX_ParmParse.H>
+#include <AMReX_MultiFabUtil.H>
+
+#ifdef AMREX_USE_HYPRE
+#include <AMReX_HypreMLABecLap.H>
+#endif
+
+#include <limits>
+#include <stdexcept>
+
+using namespace amrex;
+
+namespace {
+    // Relative tolerance reachable in the working precision
+    Real default_tol_rel ()
+    {
+        if constexpr (std::is_same_v<double,Real>) {
+            return Real(1.0e-10);
+        } else {
+            return Real(1.0e-4);
+        }
+    }
+}
+
+MyTest::MyTest ()
+{
+    readParameters();
+    initData();
+}
+
+bool
+MyTest::setMultigridType (std::string const& name)
+{
+    multigrid_type = amrex::getEnumCaseInsensitive<MultigridType>(name);
+    if (prob_type == 4 && multigrid_type != MultigridType::geometric) {
+        amrex::Print() << "\nMultigrid type " << name << " skipped: MLNodeABecLaplacian\n";
+        return false;
+    }
+    if (use_gmres && multigrid_type == MultigridType::hybrid) {
+        amrex::Print() << "\nMultigrid type " << name << " skipped: not a preconditioner\n";
+        return false;
+    }
+    amrex::Print() << "\nMultigrid type: " << name << "\n";
+    return true;
+}
+
+void
+MyTest::solve ()
+{
+#ifdef AMREX_USE_HYPRE
+    if (use_mlhypre) {
+        solveMLHypre();
+        if (mlhypre_test_throw) { return; }
+        // Unlike MLMG, the hypre solve does not stop on a NaN.
+        for (int ilev = 0; ilev < int(solution.size()); ++ilev) {
+            if (solution[ilev].contains_nan(0, solution[ilev].nComp(), 0)) {
+                amrex::Abort("MyTest::solve: solution contains NaN on level "
+                             + std::to_string(ilev));
+            }
+        }
+        return;
+    }
+#endif
+
+    if (prob_type == 1) {
+        solvePoisson();
+    } else if (prob_type == 2) {
+        if (use_gmres) {
+            solveABecLaplacianGMRES();
+        } else {
+            solveABecLaplacian();
+        }
+    } else if (prob_type == 3 || prob_type == 5) {
+        solveABecLaplacianInhomNeumann();
+    } else if (prob_type == 4) {
+        solveNodeABecLaplacian();
+    } else {
+        amrex::Abort("Unknown prob_type");
+    }
+}
+
+void
+MyTest::configureMLMG (MLMG& mlmg) const
+{
+    mlmg.setMaxIter(max_iter);
+    mlmg.setMaxFmgIter(max_fmg_iter);
+    mlmg.setVerbose(verbose);
+    mlmg.setBottomVerbose(bottom_verbose);
+    mlmg.setMultigridType(multigrid_type);
+    if (hybrid_stall_rate >= 0) { mlmg.setHybridStallCriterion(4, hybrid_stall_rate); }
+    if (use_algmg_bottom && multigrid_type == MultigridType::hybrid) {
+        mlmg.setBottomSolver(MLMG::BottomSolver::algmg);
+    }
+}
+
+void
+MyTest::solvePoisson ()
+{
+    LPInfo info;
+    info.setAgglomeration(agglomeration);
+    info.setConsolidation(consolidation);
+    info.setMixedPrecision(mixed_precision);
+    info.setDeterministic(deterministic);
+    info.setMaxCoarseningLevel(max_coarsening_level);
+
+    const auto tol_rel = default_tol_rel();
+    const auto tol_abs = Real(0.0);
+
+    const auto nlevels = static_cast<int>(geom.size());
+
+    if (composite_solve)
+    {
+        MLPoisson mlpoisson(geom, grids, dmap, info);
+
+        mlpoisson.setGaussSeidel(use_gauss_seidel);
+
+        mlpoisson.setMaxOrder(linop_maxorder);
+
+        // This is a 3d problem with Dirichlet BC
+        mlpoisson.setDomainBC({AMREX_D_DECL(LinOpBCType::Dirichlet,
+                                            LinOpBCType::Dirichlet,
+                                            LinOpBCType::Dirichlet)},
+                              {AMREX_D_DECL(LinOpBCType::Dirichlet,
+                                            LinOpBCType::Dirichlet,
+                                            LinOpBCType::Dirichlet)});
+
+        for (int ilev = 0; ilev < nlevels; ++ilev)
+        {
+            mlpoisson.setLevelBC(ilev, &solution[ilev]);
+        }
+
+        MLMG mlmg(mlpoisson);
+        configureMLMG(mlmg);
+#ifdef AMREX_USE_HYPRE
+        if (use_hypre) {
+            mlmg.setBottomSolver(MLMG::BottomSolver::hypre);
+            mlmg.setHypreInterface(hypre_interface);
+        }
+#endif
+#ifdef AMREX_USE_PETSC
+        if (use_petsc) {
+            mlmg.setBottomSolver(MLMG::BottomSolver::petsc);
+        }
+#endif
+
+        mlmg.solve(GetVecOfPtrs(solution), GetVecOfConstPtrs(rhs), tol_rel, tol_abs);
+    }
+    else
+    {
+        for (int ilev = 0; ilev < nlevels; ++ilev)
+        {
+            MLPoisson mlpoisson({geom[ilev]}, {grids[ilev]}, {dmap[ilev]}, info);
+
+            mlpoisson.setGaussSeidel(use_gauss_seidel);
+
+            mlpoisson.setMaxOrder(linop_maxorder);
+
+            // This is a 3d problem with Dirichlet BC
+            mlpoisson.setDomainBC({AMREX_D_DECL(LinOpBCType::Dirichlet,
+                                                LinOpBCType::Dirichlet,
+                                                LinOpBCType::Dirichlet)},
+                                  {AMREX_D_DECL(LinOpBCType::Dirichlet,
+                                                LinOpBCType::Dirichlet,
+                                                LinOpBCType::Dirichlet)});
+
+            if (ilev > 0) {
+                mlpoisson.setCoarseFineBC(&solution[ilev-1], ref_ratio);
+            }
+
+            mlpoisson.setLevelBC(0, &solution[ilev]);
+
+            MLMG mlmg(mlpoisson);
+            configureMLMG(mlmg);
+#ifdef AMREX_USE_HYPRE
+            if (use_hypre) {
+                mlmg.setBottomSolver(MLMG::BottomSolver::hypre);
+                mlmg.setHypreInterface(hypre_interface);
+            }
+#endif
+#ifdef AMREX_USE_PETSC
+            if (use_petsc) {
+                mlmg.setBottomSolver(MLMG::BottomSolver::petsc);
+            }
+#endif
+
+            mlmg.solve({&solution[ilev]}, {&rhs[ilev]}, tol_rel, tol_abs);
+        }
+    }
+}
+
+void
+MyTest::solveABecLaplacian ()
+{
+    LPInfo info;
+    info.setAgglomeration(agglomeration);
+    info.setConsolidation(consolidation);
+    info.setMixedPrecision(mixed_precision);
+    info.setSemicoarsening(semicoarsening);
+    info.setMaxCoarseningLevel(max_coarsening_level);
+    info.setMaxSemicoarseningLevel(max_semicoarsening_level);
+    info.setSemicoarseningDirection(semicoarsening_direction);
+
+    const auto tol_rel = default_tol_rel();
+    const auto tol_abs = Real(0.0);
+
+    const auto nlevels = static_cast<int>(geom.size());
+
+    if (composite_solve)
+    {
+
+        MLABecLaplacian mlabec(geom, grids, dmap, info);
+
+        mlabec.setGaussSeidel(use_gauss_seidel);
+
+        mlabec.setMaxOrder(linop_maxorder);
+
+        mlabec.setDomainBC({AMREX_D_DECL(LinOpBCType::Dirichlet,
+                                         LinOpBCType::Neumann,
+                                         LinOpBCType::Neumann)},
+                           {AMREX_D_DECL(LinOpBCType::Neumann,
+                                         LinOpBCType::Dirichlet,
+                                         LinOpBCType::Neumann)});
+
+        for (int ilev = 0; ilev < nlevels; ++ilev)
+        {
+            mlabec.setLevelBC(ilev, &solution[ilev]);
+        }
+
+        mlabec.setScalars(ascalar, bscalar);
+
+        for (int ilev = 0; ilev < nlevels; ++ilev)
+        {
+            mlabec.setACoeffs(ilev, acoef[ilev]);
+
+            Array<MultiFab,AMREX_SPACEDIM> face_bcoef;
+            for (int idim = 0; idim < AMREX_SPACEDIM; ++idim)
+            {
+                const BoxArray& ba = amrex::convert(bcoef[ilev].boxArray(),
+                                                    IntVect::TheDimensionVector(idim));
+                face_bcoef[idim].define(ba, bcoef[ilev].DistributionMap(), 1, 0);
+            }
+            amrex::average_cellcenter_to_face(GetArrOfPtrs(face_bcoef),
+                                              bcoef[ilev], geom[ilev]);
+            mlabec.setBCoeffs(ilev, amrex::GetArrOfConstPtrs(face_bcoef));
+        }
+
+        MLMG mlmg(mlabec);
+        configureMLMG(mlmg);
+#ifdef AMREX_USE_HYPRE
+        if (use_hypre) {
+            mlmg.setBottomSolver(MLMG::BottomSolver::hypre);
+            mlmg.setHypreInterface(hypre_interface);
+        }
+#endif
+#ifdef AMREX_USE_PETSC
+        if (use_petsc) {
+            mlmg.setBottomSolver(MLMG::BottomSolver::petsc);
+        }
+#endif
+
+        mlmg.solve(GetVecOfPtrs(solution), GetVecOfConstPtrs(rhs), tol_rel, tol_abs);
+    }
+    else
+    {
+        for (int ilev = 0; ilev < nlevels; ++ilev)
+        {
+            MLABecLaplacian mlabec({geom[ilev]}, {grids[ilev]}, {dmap[ilev]}, info);
+
+            mlabec.setGaussSeidel(use_gauss_seidel);
+
+            mlabec.setMaxOrder(linop_maxorder);
+
+            mlabec.setDomainBC({AMREX_D_DECL(LinOpBCType::Dirichlet,
+                                             LinOpBCType::Neumann,
+                                             LinOpBCType::Neumann)},
+                               {AMREX_D_DECL(LinOpBCType::Neumann,
+                                             LinOpBCType::Dirichlet,
+                                             LinOpBCType::Neumann)});
+
+            if (ilev > 0) {
+                mlabec.setCoarseFineBC(&solution[ilev-1], ref_ratio);
+            }
+
+            mlabec.setLevelBC(0, &solution[ilev]);
+
+            mlabec.setScalars(ascalar, bscalar);
+
+            mlabec.setACoeffs(0, acoef[ilev]);
+
+            Array<MultiFab,AMREX_SPACEDIM> face_bcoef;
+            for (int idim = 0; idim < AMREX_SPACEDIM; ++idim)
+            {
+                const BoxArray& ba = amrex::convert(bcoef[ilev].boxArray(),
+                                                    IntVect::TheDimensionVector(idim));
+                face_bcoef[idim].define(ba, bcoef[ilev].DistributionMap(), 1, 0);
+            }
+            amrex::average_cellcenter_to_face(GetArrOfPtrs(face_bcoef),
+                                              bcoef[ilev], geom[ilev]);
+            mlabec.setBCoeffs(0, amrex::GetArrOfConstPtrs(face_bcoef));
+
+            MLMG mlmg(mlabec);
+            configureMLMG(mlmg);
+#ifdef AMREX_USE_HYPRE
+            if (use_hypre) {
+                mlmg.setBottomSolver(MLMG::BottomSolver::hypre);
+                mlmg.setHypreInterface(hypre_interface);
+            }
+#endif
+#ifdef AMREX_USE_PETSC
+            if (use_petsc) {
+                mlmg.setBottomSolver(MLMG::BottomSolver::petsc);
+            }
+#endif
+
+            mlmg.solve({&solution[ilev]}, {&rhs[ilev]}, tol_rel, tol_abs);
+        }
+    }
+}
+
+void
+MyTest::solveABecLaplacianInhomNeumann ()
+{
+    LPInfo info;
+    info.setAgglomeration(agglomeration);
+    info.setConsolidation(consolidation);
+    info.setMixedPrecision(mixed_precision);
+    info.setMaxCoarseningLevel(max_coarsening_level);
+
+    const auto tol_rel = default_tol_rel();
+    const auto tol_abs = Real(0.0);
+
+    const auto nlevels = static_cast<int>(geom.size());
+
+    // prob_type 3: inhomogeneous Neumann BC; prob_type 5: Robin BC
+    const bool robin = (prob_type == 5);
+    const auto bct = robin ? LinOpBCType::Robin : LinOpBCType::inhomogNeumann;
+
+    if (composite_solve)
+    {
+
+        MLABecLaplacian mlabec(geom, grids, dmap, info);
+
+        mlabec.setGaussSeidel(use_gauss_seidel);
+
+        mlabec.setMaxOrder(linop_maxorder);
+
+        mlabec.setDomainBC({AMREX_D_DECL(bct,bct,bct)}, {AMREX_D_DECL(bct,bct,bct)});
+
+        for (int ilev = 0; ilev < nlevels; ++ilev)
+        {
+            // the boundary values, or the Robin a, b and f
+            mlabec.setLevelBC(ilev, &(solution[ilev]),
+                              robin ? &robin_a[ilev] : nullptr,
+                              robin ? &robin_b[ilev] : nullptr,
+                              robin ? &robin_f[ilev] : nullptr);
+        }
+
+        mlabec.setScalars(ascalar, bscalar);
+
+        for (int ilev = 0; ilev < nlevels; ++ilev)
+        {
+            mlabec.setACoeffs(ilev, acoef[ilev]);
+
+            Array<MultiFab,AMREX_SPACEDIM> face_bcoef;
+            for (int idim = 0; idim < AMREX_SPACEDIM; ++idim)
+            {
+                const BoxArray& ba = amrex::convert(bcoef[ilev].boxArray(),
+                                                    IntVect::TheDimensionVector(idim));
+                face_bcoef[idim].define(ba, bcoef[ilev].DistributionMap(), 1, 0);
+            }
+            amrex::average_cellcenter_to_face(GetArrOfPtrs(face_bcoef),
+                                              bcoef[ilev], geom[ilev]);
+            mlabec.setBCoeffs(ilev, amrex::GetArrOfConstPtrs(face_bcoef));
+        }
+
+        MLMG mlmg(mlabec);
+        configureMLMG(mlmg);
+#ifdef AMREX_USE_HYPRE
+        if (use_hypre) {
+            mlmg.setBottomSolver(MLMG::BottomSolver::hypre);
+            mlmg.setHypreInterface(hypre_interface);
+        }
+#endif
+#ifdef AMREX_USE_PETSC
+        if (use_petsc) {
+            mlmg.setBottomSolver(MLMG::BottomSolver::petsc);
+        }
+#endif
+
+        mlmg.solve(GetVecOfPtrs(solution), GetVecOfConstPtrs(rhs), tol_rel, tol_abs);
+    }
+    else
+    {
+        for (int ilev = 0; ilev < nlevels; ++ilev)
+        {
+            MLABecLaplacian mlabec({geom[ilev]}, {grids[ilev]}, {dmap[ilev]}, info);
+
+            mlabec.setGaussSeidel(use_gauss_seidel);
+
+            mlabec.setMaxOrder(linop_maxorder);
+
+            mlabec.setDomainBC({AMREX_D_DECL(bct,bct,bct)}, {AMREX_D_DECL(bct,bct,bct)});
+
+            if (ilev > 0) {
+                mlabec.setCoarseFineBC(&solution[ilev-1], ref_ratio);
+            }
+
+            // the boundary values, or the Robin a, b and f
+            mlabec.setLevelBC(0, &solution[ilev],
+                              robin ? &robin_a[ilev] : nullptr,
+                              robin ? &robin_b[ilev] : nullptr,
+                              robin ? &robin_f[ilev] : nullptr);
+
+            mlabec.setScalars(ascalar, bscalar);
+
+            mlabec.setACoeffs(0, acoef[ilev]);
+
+            Array<MultiFab,AMREX_SPACEDIM> face_bcoef;
+            for (int idim = 0; idim < AMREX_SPACEDIM; ++idim)
+            {
+                const BoxArray& ba = amrex::convert(bcoef[ilev].boxArray(),
+                                                    IntVect::TheDimensionVector(idim));
+                face_bcoef[idim].define(ba, bcoef[ilev].DistributionMap(), 1, 0);
+            }
+            amrex::average_cellcenter_to_face(GetArrOfPtrs(face_bcoef),
+                                              bcoef[ilev], geom[ilev]);
+            mlabec.setBCoeffs(0, amrex::GetArrOfConstPtrs(face_bcoef));
+
+            MLMG mlmg(mlabec);
+            configureMLMG(mlmg);
+#ifdef AMREX_USE_HYPRE
+            if (use_hypre) {
+                mlmg.setBottomSolver(MLMG::BottomSolver::hypre);
+                mlmg.setHypreInterface(hypre_interface);
+            }
+#endif
+#ifdef AMREX_USE_PETSC
+            if (use_petsc) {
+                mlmg.setBottomSolver(MLMG::BottomSolver::petsc);
+            }
+#endif
+
+            mlmg.solve({&solution[ilev]}, {&rhs[ilev]}, tol_rel, tol_abs);
+        }
+    }
+}
+
+void
+MyTest::solveNodeABecLaplacian ()
+{
+    LPInfo info;
+    info.setAgglomeration(agglomeration);
+    info.setConsolidation(consolidation);
+    info.setMaxCoarseningLevel(max_coarsening_level);
+
+    const auto tol_rel = default_tol_rel();
+    const auto tol_abs = Real(0.0);
+
+    const auto nlevels = static_cast<int>(geom.size());
+
+    if (composite_solve && nlevels > 1)
+    {
+        amrex::Abort("solveNodeABecLaplacian: TODO composite_solve");
+    }
+    else
+    {
+        AMREX_ALWAYS_ASSERT_WITH_MESSAGE(nlevels == 1, "solveNodeABecLaplacian: nlevels > 1 TODO");
+        for (int ilev = 0; ilev < nlevels; ++ilev)
+        {
+            MLNodeABecLaplacian mlndabec({geom[ilev]}, {grids[ilev]}, {dmap[ilev]},
+                                         info);
+
+            mlndabec.setDomainBC({AMREX_D_DECL(LinOpBCType::Dirichlet,
+                                               LinOpBCType::Neumann,
+                                               LinOpBCType::Dirichlet)},
+                                 {AMREX_D_DECL(LinOpBCType::Neumann,
+                                               LinOpBCType::Dirichlet,
+                                               LinOpBCType::Dirichlet)});
+
+            mlndabec.setScalars(ascalar, bscalar);
+
+            mlndabec.setACoeffs(0, acoef[ilev]);
+            mlndabec.setBCoeffs(0, bcoef[ilev]);
+
+            MLMG mlmg(mlndabec);
+            configureMLMG(mlmg);
+
+            mlmg.solve({&solution[ilev]}, {&rhs[ilev]}, tol_rel, tol_abs);
+        }
+    }
+}
+
+void
+MyTest::solveABecLaplacianGMRES ()
+{
+    LPInfo info;
+    info.setAgglomeration(agglomeration);
+    info.setConsolidation(consolidation);
+    info.setMixedPrecision(mixed_precision);
+    info.setSemicoarsening(semicoarsening);
+    info.setMaxCoarseningLevel(max_coarsening_level);
+    info.setMaxSemicoarseningLevel(max_semicoarsening_level);
+    info.setSemicoarseningDirection(semicoarsening_direction);
+
+    const auto tol_rel = default_tol_rel();
+    const auto tol_abs = Real(0.0);
+
+    const auto nlevels = static_cast<int>(geom.size());
+
+    if (composite_solve)
+    {
+        MLABecLaplacian mlabec(geom, grids, dmap, info);
+
+        mlabec.setMaxOrder(linop_maxorder);
+
+        mlabec.setDomainBC({AMREX_D_DECL(LinOpBCType::Dirichlet,
+                                         LinOpBCType::Neumann,
+                                         LinOpBCType::Neumann)},
+                           {AMREX_D_DECL(LinOpBCType::Neumann,
+                                         LinOpBCType::Dirichlet,
+                                         LinOpBCType::Neumann)});
+
+        for (int ilev = 0; ilev < nlevels; ++ilev)
+        {
+            mlabec.setLevelBC(ilev, &solution[ilev]);
+        }
+
+        mlabec.setScalars(ascalar, bscalar);
+
+        for (int ilev = 0; ilev < nlevels; ++ilev)
+        {
+            mlabec.setACoeffs(ilev, acoef[ilev]);
+
+            Array<MultiFab,AMREX_SPACEDIM> face_bcoef;
+            for (int idim = 0; idim < AMREX_SPACEDIM; ++idim)
+            {
+                const BoxArray& ba = amrex::convert(bcoef[ilev].boxArray(),
+                                                    IntVect::TheDimensionVector(idim));
+                face_bcoef[idim].define(ba, bcoef[ilev].DistributionMap(), 1, 0);
+            }
+            amrex::average_cellcenter_to_face(GetArrOfPtrs(face_bcoef),
+                                              bcoef[ilev], geom[ilev]);
+            mlabec.setBCoeffs(ilev, amrex::GetArrOfConstPtrs(face_bcoef));
+        }
+
+        MLMG mlmg(mlabec);
+        mlmg.setMultigridType(multigrid_type);
+        GMRESMLMGT<MultiFab> gmsolver(mlmg);
+        gmsolver.usePrecond(true);
+        gmsolver.setVerbose(verbose);
+        gmsolver.solve(GetVecOfPtrs(solution), GetVecOfConstPtrs(rhs), tol_rel, tol_abs);
+
+        if (verbose) {
+            Vector<MultiFab> res(nlevels);
+            for (int ilev = 0; ilev < nlevels; ++ilev) {
+                res[ilev].define(rhs[ilev].boxArray(), rhs[ilev].DistributionMap(), 1, 0);
+            }
+            mlmg.apply(GetVecOfPtrs(res), GetVecOfPtrs(solution)); // res = L(sol)
+            for (int ilev = 0; ilev < nlevels; ++ilev) {
+                MultiFab::Subtract(res[ilev], rhs[ilev], 0, 0, 1, 0);
+                amrex::Print() << "Final residual at level " << ilev << " = "
+                               << res[ilev].norminf(0) << " " << res[ilev].norm1(0) << " "
+                               << res[ilev].norm2(0) << '\n';
+            }
+        }
+    }
+    else
+    {
+        for (int ilev = 0; ilev < nlevels; ++ilev)
+        {
+            MLABecLaplacian mlabec({geom[ilev]}, {grids[ilev]}, {dmap[ilev]}, info);
+
+            mlabec.setMaxOrder(linop_maxorder);
+
+            mlabec.setDomainBC({AMREX_D_DECL(LinOpBCType::Dirichlet,
+                                             LinOpBCType::Neumann,
+                                             LinOpBCType::Neumann)},
+                               {AMREX_D_DECL(LinOpBCType::Neumann,
+                                             LinOpBCType::Dirichlet,
+                                             LinOpBCType::Neumann)});
+
+            if (ilev > 0) {
+                mlabec.setCoarseFineBC(&solution[ilev-1], ref_ratio);
+            }
+
+            // for problem with pure homogeneous Neumann BC, we could pass a nullptr
+            mlabec.setLevelBC(0, &solution[ilev]);
+
+            mlabec.setScalars(ascalar, bscalar);
+
+            mlabec.setACoeffs(0, acoef[ilev]);
+
+            Array<MultiFab,AMREX_SPACEDIM> face_bcoef;
+            for (int idim = 0; idim < AMREX_SPACEDIM; ++idim)
+            {
+                const BoxArray& ba = amrex::convert(bcoef[ilev].boxArray(),
+                                                    IntVect::TheDimensionVector(idim));
+                face_bcoef[idim].define(ba, bcoef[ilev].DistributionMap(), 1, 0);
+            }
+            amrex::average_cellcenter_to_face(GetArrOfPtrs(face_bcoef),
+                                              bcoef[ilev], geom[ilev]);
+            mlabec.setBCoeffs(0, amrex::GetArrOfConstPtrs(face_bcoef));
+
+            MLMG mlmg(mlabec);
+            mlmg.setMultigridType(multigrid_type);
+            GMRESMLMGT gmsolver(mlmg);
+            gmsolver.usePrecond(true);
+            gmsolver.setVerbose(verbose);
+            gmsolver.solve(solution[ilev], rhs[ilev], tol_rel, tol_abs);
+
+            if (verbose) {
+                MultiFab res(rhs[ilev].boxArray(), rhs[ilev].DistributionMap(), 1, 0);
+                mlmg.apply({&res}, {&solution[ilev]}); // res = L(sol)
+                MultiFab::Subtract(res, rhs[ilev], 0, 0, 1, 0); // now res = L(sol) - rhs
+                amrex::Print() << "Final residual = " << res.norminf(0)
+                               << " " << res.norm1(0) << " " << res.norm2(0) << '\n';
+            }
+        }
+    }
+}
+
+void
+MyTest::readParameters ()
+{
+    ParmParse pp;
+    pp.query("max_level", max_level);
+    pp.query("ref_ratio", ref_ratio);
+    {   // n_cell: one value (cubic domain) or one per direction
+        std::vector<int> nc;
+        pp.queryarr("n_cell", nc);
+        if (nc.size() == 1) {
+            n_cell = IntVect(nc[0]);
+        } else if (nc.size() == AMREX_SPACEDIM) {
+            for (int idim = 0; idim < AMREX_SPACEDIM; ++idim) { n_cell[idim] = nc[idim]; }
+        } else if (!nc.empty()) {
+            amrex::Abort("n_cell needs 1 or AMREX_SPACEDIM values");
+        }
+        // the exact solutions fit the BCs only for sides of length 1 or 1/2
+        for (int idim = 0; idim < AMREX_SPACEDIM; ++idim) {
+            AMREX_ALWAYS_ASSERT_WITH_MESSAGE(n_cell[idim] == n_cell.max() ||
+                                             2*n_cell[idim] == n_cell.max(),
+                                             "each n_cell must be n_cell.max() or n_cell.max()/2");
+        }
+    }
+    pp.query("max_grid_size", max_grid_size);
+
+    pp.query("composite_solve", composite_solve);
+
+    pp.query("use_mlhypre", use_mlhypre);
+    pp.query("mlhypre_num_setups", mlhypre_num_setups);
+    pp.query("mlhypre_resolve", mlhypre_resolve);
+    pp.query("mlhypre_test_throw", mlhypre_test_throw);
+    pp.query("periodic_x", periodic_x);
+    pp.query("max_error", max_error);
+    pp.query("use_hypre_ssamg", use_hypre_ssamg);
+
+    pp.query("prob_type", prob_type);
+    // after every value it checks has been read
+    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(!periodic_x || (use_mlhypre && prob_type == 1 &&
+                                                     composite_solve && max_level == 1 &&
+                                                     n_cell[0] == n_cell.max()),
+        "periodic_x needs use_mlhypre, prob_type = 1, composite_solve, max_level = 1"
+        " and n_cell[0] = n_cell.max()");
+    // nearly singular (ascalar = 1e-3); a short x side loses the error cancellation
+    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(prob_type != 3 || n_cell[0] == n_cell.max(),
+                                     "prob_type = 3 needs n_cell[0] = n_cell.max()");
+
+    pp.query("verbose", verbose);
+    pp.query("do_plots", do_plots);
+    pp.query("bottom_verbose", bottom_verbose);
+    pp.query("max_iter", max_iter);
+    pp.query("max_fmg_iter", max_fmg_iter);
+    pp.query("linop_maxorder", linop_maxorder);
+    pp.query("agglomeration", agglomeration);
+    pp.query("consolidation", consolidation);
+    pp.query("deterministic", deterministic);
+    pp.query("mixed_precision", mixed_precision);
+    pp.query("semicoarsening", semicoarsening);
+    pp.query("max_coarsening_level", max_coarsening_level);
+    pp.query("max_semicoarsening_level", max_semicoarsening_level);
+    pp.query("semicoarsening_direction", semicoarsening_direction);
+
+    pp.query("use_gauss_seidel", use_gauss_seidel);
+
+    pp.query("use_gmres", use_gmres);
+    AMREX_ALWAYS_ASSERT(use_gmres == false || prob_type == 2);
+
+#ifdef AMREX_USE_HYPRE
+    pp.query("use_hypre", use_hypre);
+    pp.query("hypre_interface", hypre_interface_i);
+    if (hypre_interface_i == 1) {
+        hypre_interface = Hypre::Interface::structed;
+    } else if (hypre_interface_i == 2) {
+        hypre_interface = Hypre::Interface::semi_structed;
+    } else {
+        hypre_interface = Hypre::Interface::ij;
+    }
+#endif
+#ifdef AMREX_USE_PETSC
+    pp.query("use_petsc", use_petsc);
+#endif
+    pp.queryarr("multigrid_types", multigrid_types);
+    pp.query("use_algmg_bottom", use_algmg_bottom);
+    pp.query("hybrid_stall_rate", hybrid_stall_rate);
+    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(!(use_hypre && use_petsc),
+                                     "use_hypre & use_petsc cannot be both true");
+}
+
+void
+MyTest::initData ()
+{
+    int nlevels = max_level + 1;
+    geom.resize(nlevels);
+    grids.resize(nlevels);
+    dmap.resize(nlevels);
+
+    solution.resize(nlevels);
+    rhs.resize(nlevels);
+    exact_solution.resize(nlevels);
+
+    if (prob_type == 2 || prob_type == 3 || prob_type == 4 || prob_type == 5) {
+        acoef.resize(nlevels);
+        bcoef.resize(nlevels);
+    }
+    if (prob_type == 5) {
+        robin_a.resize(nlevels);
+        robin_b.resize(nlevels);
+        robin_f.resize(nlevels);
+    }
+
+    // Cubic cells; the longest side has length 1.
+    const auto lmax = Real(n_cell.max());
+    RealBox rb({AMREX_D_DECL(0.,0.,0.)}, {AMREX_D_DECL(n_cell[0]/lmax,n_cell[1]/lmax,n_cell[2]/lmax)});
+    Array<int,AMREX_SPACEDIM> is_periodic{AMREX_D_DECL(int(periodic_x),0,0)};
+    Geometry::Setup(&rb, 0, is_periodic.data());
+    Box domain0(IntVect(0), n_cell-1);
+    Box domain = domain0;
+    for (int ilev = 0; ilev < nlevels; ++ilev)
+    {
+        geom[ilev].define(domain);
+        domain.refine(ref_ratio);
+    }
+
+    domain = domain0;
+    for (int ilev = 0; ilev < nlevels; ++ilev)
+    {
+        grids[ilev].define(domain);
+        grids[ilev].maxSize(max_grid_size);
+        domain.grow(-n_cell/4);   // fine level cover the middle of the coarse domain
+        if (periodic_x) { // ... except in x, where it touches the high end
+            domain.setSmall(0, n_cell[0]/2);
+            domain.setBig(0, n_cell[0]-1);
+        }
+        domain.refine(ref_ratio);
+    }
+
+    for (int ilev = 0; ilev < nlevels; ++ilev)
+    {
+        dmap[ilev].define(grids[ilev]);
+        BoxArray ba = grids[ilev];
+        if (prob_type == 4) {
+            ba.surroundingNodes();
+        }
+        solution      [ilev].define(ba, dmap[ilev], 1, 1);
+        rhs           [ilev].define(ba, dmap[ilev], 1, 0);
+        exact_solution[ilev].define(ba, dmap[ilev], 1, 0);
+        if (!acoef.empty()) {
+            acoef[ilev].define(ba         , dmap[ilev], 1, 0);
+            const int ngb = (prob_type == 4) ? 0 : 1;
+            bcoef[ilev].define(grids[ilev], dmap[ilev], 1, ngb);
+        }
+        if (!robin_a.empty()) {
+            robin_a[ilev].define(grids[ilev], dmap[ilev], 1, 1);
+            robin_b[ilev].define(grids[ilev], dmap[ilev], 1, 1);
+            robin_f[ilev].define(grids[ilev], dmap[ilev], 1, 1);
+            robin_a[ilev].setVal(0.0);
+            robin_b[ilev].setVal(0.0);
+            robin_f[ilev].setVal(0.0);
+        }
+    }
+
+    if (prob_type == 1) {
+        initProbPoisson();
+    } else if (prob_type == 2) {
+        initProbABecLaplacian();
+    } else if (prob_type == 3) {
+        initProbABecLaplacianInhomNeumann();
+    } else if (prob_type == 4) {
+        initProbNodeABecLaplacian();
+    } else if (prob_type == 5) {
+        initProbABecLaplacianRobin();
+    } else {
+        amrex::Abort("Unknown prob_type "+std::to_string(prob_type));
+    }
+}
+
+#ifdef AMREX_USE_HYPRE
+void
+MyTest::solveMLHypre ()
+{
+    const auto tol_rel = default_tol_rel();
+    const auto tol_abs = Real(0.0);
+
+    const auto nlevels = static_cast<int>(geom.size());
+
+    // Composite solve; see mlhypre_test_throw
+    auto composite_solve_or_throw = [&] (HypreMLABecLap& h)
+    {
+        if (mlhypre_test_throw == 0) {
+            h.solve(GetVecOfPtrs(solution), GetVecOfConstPtrs(rhs), tol_rel, tol_abs);
+            return;
+        }
+        if (mlhypre_test_throw == 1) {
+            for (auto& mf : rhs) { mf.setVal(std::numeric_limits<Real>::quiet_NaN()); }
+        }
+        h.setThrowException(true);
+        try {
+            h.solve(GetVecOfPtrs(solution), GetVecOfConstPtrs(rhs), tol_rel, tol_abs);
+        } catch (std::runtime_error const& e) {
+            amrex::Print() << "mlhypre_test_throw: caught \"" << e.what() << "\"\n";
+            return;
+        }
+        amrex::Abort("mlhypre_test_throw: the solve did not throw");
+    };
+
+    if (mlhypre_test_throw == 2) {
+        AMREX_ALWAYS_ASSERT_WITH_MESSAGE(prob_type == 2 && composite_solve,
+            "mlhypre_test_throw = 2 needs prob_type = 2 and composite_solve");
+        for (auto& mf : acoef) { mf.setVal(std::numeric_limits<Real>::quiet_NaN()); }
+    }
+
+#ifdef AMREX_FEATURE_HYPRE_SSAMG
+    auto hypre_solver_id = use_hypre_ssamg ? HypreSolverID::SSAMG
+                                           : HypreSolverID::BoomerAMG;
+#else
+    auto hypre_solver_id = HypreSolverID::BoomerAMG;
+#endif
+
+    if (prob_type == 1) { // Poisson
+        if (composite_solve) {
+            HypreMLABecLap hypre_mlabeclap(geom, grids, dmap, hypre_solver_id);
+            hypre_mlabeclap.setVerbose(verbose);
+            // mlhypre_num_setups > 1: repeated setups on the same object, each
+            // solved from zero; reuse is turned on after the first setup (in
+            // place with the hypre backend)
+            for (int isetup = 0; isetup < mlhypre_num_setups; ++isetup) {
+                if (isetup > 0) {
+                    hypre_mlabeclap.setReuseSolverSetup(true);
+                    for (auto& mf : solution) { mf.setVal(Real(0.0), 0, 1, 0); }
+                }
+
+                // periodic_x: unit b coefficients, so that the fine ones at
+                // the coarse/fine faces across the periodic boundary are used
+                Vector<Array<MultiFab,AMREX_SPACEDIM>> unit_b;
+                if (periodic_x) {
+                    unit_b.resize(nlevels);
+                    for (int ilev = 0; ilev < nlevels; ++ilev) {
+                        for (int idim = 0; idim < AMREX_SPACEDIM; ++idim) {
+                            unit_b[ilev][idim].define(
+                                amrex::convert(grids[ilev], IntVect::TheDimensionVector(idim)),
+                                dmap[ilev], 1, 0);
+                            unit_b[ilev][idim].setVal(Real(1.0));
+                        }
+                    }
+                }
+                auto const xbc = periodic_x ? LinOpBCType::Periodic : LinOpBCType::Dirichlet;
+                hypre_mlabeclap.setup(Real(0.0), Real(-1.0), {}, GetVecOfArrOfConstPtrs(unit_b),
+                                      {AMREX_D_DECL(xbc,
+                                                    LinOpBCType::Dirichlet,
+                                                    LinOpBCType::Dirichlet)},
+                                      {AMREX_D_DECL(xbc,
+                                                    LinOpBCType::Dirichlet,
+                                                    LinOpBCType::Dirichlet)},
+                                      GetVecOfConstPtrs(solution));
+
+                composite_solve_or_throw(hypre_mlabeclap);
+            }
+        } else {
+            for (int ilev = 0; ilev < nlevels; ++ilev) {
+                HypreMLABecLap hypre_mlabeclap({geom[ilev]}, {grids[ilev]}, {dmap[ilev]}, hypre_solver_id);
+                hypre_mlabeclap.setVerbose(verbose);
+
+                std::pair<MultiFab const*, IntVect> coarse_bc{nullptr,IntVect(0)};
+                if (ilev > 0) {
+                    coarse_bc.first = &solution[ilev-1];
+                    coarse_bc.second = IntVect(ref_ratio);
+                }
+
+                hypre_mlabeclap.setup(Real(0.0), Real(-1.0), {}, {},
+                                      {AMREX_D_DECL(LinOpBCType::Dirichlet,
+                                                    LinOpBCType::Dirichlet,
+                                                    LinOpBCType::Dirichlet)},
+                                      {AMREX_D_DECL(LinOpBCType::Dirichlet,
+                                                    LinOpBCType::Dirichlet,
+                                                    LinOpBCType::Dirichlet)},
+                                      {&solution[ilev]},
+                                      coarse_bc);
+
+                hypre_mlabeclap.solve({&solution[ilev]}, {&rhs[ilev]}, tol_rel, tol_abs);
+            }
+        }
+    } else if (prob_type == 2) { // ABecLaplacian
+        Vector<Array<MultiFab,AMREX_SPACEDIM>> face_bcoef(nlevels);
+        for (int ilev = 0; ilev < nlevels; ++ilev) {
+            for (int idim = 0; idim < AMREX_SPACEDIM; ++idim) {
+                const BoxArray& ba = amrex::convert(bcoef[ilev].boxArray(),
+                                                    IntVect::TheDimensionVector(idim));
+                face_bcoef[ilev][idim].define(ba, bcoef[ilev].DistributionMap(), 1, 0);
+            }
+            amrex::average_cellcenter_to_face(GetArrOfPtrs(face_bcoef[ilev]),
+                                              bcoef[ilev], geom[ilev]);
+        }
+
+        if (composite_solve) {
+            HypreMLABecLap hypre_mlabeclap(geom, grids, dmap, hypre_solver_id);
+            hypre_mlabeclap.setVerbose(verbose);
+            // mlhypre_num_setups > 1: repeated setups on the same object, each
+            // solved from zero; reuse is turned on after the first setup (in
+            // place with the hypre backend)
+            for (int isetup = 0; isetup < mlhypre_num_setups; ++isetup) {
+                if (isetup > 0) {
+                    hypre_mlabeclap.setReuseSolverSetup(true);
+                    for (auto& mf : solution) { mf.setVal(Real(0.0), 0, 1, 0); }
+                }
+
+                // Setup k scales the operator and the rhs by k+1: the same
+                // solution from new matrix values (updated in place)
+                Real const scale = Real(1 + isetup);
+                hypre_mlabeclap.setup(ascalar*scale, bscalar*scale,
+                                      GetVecOfConstPtrs(acoef),
+                                      GetVecOfArrOfConstPtrs(face_bcoef),
+                                      {AMREX_D_DECL(LinOpBCType::Dirichlet,
+                                                    LinOpBCType::Neumann,
+                                                    LinOpBCType::Neumann)},
+                                      {AMREX_D_DECL(LinOpBCType::Neumann,
+                                                    LinOpBCType::Dirichlet,
+                                                    LinOpBCType::Neumann)},
+                                      GetVecOfConstPtrs(solution));
+
+                for (auto& mf : rhs) { mf.mult(scale); }
+                composite_solve_or_throw(hypre_mlabeclap);
+                if (mlhypre_resolve && isetup > 0) {
+                    // again from zero without a new setup: a pending setup
+                    // reset (reuse_setup_max_iter) must apply to this solve
+                    for (auto& mf : solution) { mf.setVal(Real(0.0), 0, 1, 0); }
+                    composite_solve_or_throw(hypre_mlabeclap);
+                }
+                for (auto& mf : rhs) { mf.mult(Real(1.0)/scale); }
+            }
+        } else {
+            for (int ilev = 0; ilev < nlevels; ++ilev) {
+                HypreMLABecLap hypre_mlabeclap({geom[ilev]}, {grids[ilev]}, {dmap[ilev]}, hypre_solver_id);
+                hypre_mlabeclap.setVerbose(verbose);
+
+                std::pair<MultiFab const*, IntVect> coarse_bc{nullptr,IntVect(0)};
+                if (ilev > 0) {
+                    coarse_bc.first = &solution[ilev-1];
+                    coarse_bc.second = IntVect(ref_ratio);
+                }
+
+                hypre_mlabeclap.setup(ascalar, bscalar,
+                                      {&acoef[ilev]},
+                                      {GetArrOfConstPtrs(face_bcoef[ilev])},
+                                      {AMREX_D_DECL(LinOpBCType::Dirichlet,
+                                                    LinOpBCType::Neumann,
+                                                    LinOpBCType::Neumann)},
+                                      {AMREX_D_DECL(LinOpBCType::Neumann,
+                                                    LinOpBCType::Dirichlet,
+                                                    LinOpBCType::Neumann)},
+                                      {&solution[ilev]},
+                                      coarse_bc);
+
+                hypre_mlabeclap.solve({&solution[ilev]}, {&rhs[ilev]}, tol_rel, tol_abs);
+            }
+        }
+    } else {
+        amrex::Abort("Unsupported prob_type: " + std::to_string(prob_type));
+    }
+}
+#endif

@@ -1,0 +1,12 @@
+
+ifneq ($(DIM),1)
+
+CEXE_headers += AMReX_PETSc.H
+
+CEXE_sources += AMReX_PETSc.cpp
+
+VPATH_LOCATIONS += $(AMREX_HOME)/Src/Extern/PETSc
+INCLUDE_LOCATIONS += $(AMREX_HOME)/Src/Extern/PETSc
+
+
+endif

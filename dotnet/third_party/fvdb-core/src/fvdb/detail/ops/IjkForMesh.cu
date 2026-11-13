@@ -1,0 +1,294 @@
+// Copyright Contributors to the OpenVDB Project
+// SPDX-License-Identifier: Apache-2.0
+//
+#include <fvdb/detail/ops/IjkForMesh.h>
+#include <fvdb/detail/utils/AccessorHelpers.cuh>
+#include <fvdb/detail/utils/Utils.h>
+#include <fvdb/detail/utils/cuda/ForEachCUDA.cuh>
+#include <fvdb/detail/utils/cuda/GridDim.h>
+#include <fvdb/detail/utils/cuda/RAIIRawDeviceBuffer.h>
+
+#include <c10/cuda/CUDACachingAllocator.h>
+#include <c10/cuda/CUDAGuard.h>
+
+#include <cub/cub.cuh>
+
+#include <stdio.h>
+
+namespace fvdb {
+namespace detail {
+namespace ops {
+
+template <typename ScalarF, typename ScalarI>
+__device__ void
+countVoxelsPerTriToCheck(int32_t bidx,
+                         int32_t eidx,
+                         const VoxelCoordTransform *transforms,
+                         const JaggedRAcc64<ScalarF, 2> vertices,
+                         const JaggedRAcc64<ScalarI, 2> triangles,
+                         TorchRAcc64<int32_t, 1> outNumSamplesPerTri) {
+    using Vec3F = nanovdb::math::Vec3<ScalarF>;
+    using Vec3I = nanovdb::math::Vec3<ScalarI>;
+
+    const VoxelCoordTransform tx        = transforms[bidx];
+    const TorchRAcc64<ScalarI, 2> faces = triangles.data();
+    const TorchRAcc64<ScalarF, 2> verts = vertices.data();
+
+    // Voxel space triangle vertices
+    const int64_t off = vertices.offsetStart(bidx);
+    const Vec3F v1    = tx.apply(verts[off + faces[eidx][0]][0],
+                              verts[off + faces[eidx][0]][1],
+                              verts[off + faces[eidx][0]][2]);
+    const Vec3F v2    = tx.apply(verts[off + faces[eidx][1]][0],
+                              verts[off + faces[eidx][1]][1],
+                              verts[off + faces[eidx][1]][2]);
+    const Vec3F v3    = tx.apply(verts[off + faces[eidx][2]][0],
+                              verts[off + faces[eidx][2]][1],
+                              verts[off + faces[eidx][2]][2]);
+
+    // Edges of triangle in voxel space
+    const Vec3F e1 = v2 - v1;
+    const Vec3F e2 = v3 - v1;
+
+    // Spacing between samples to ensure coverage
+    const ScalarF spacing = sqrt(3.0) / 3.0; // This is very conservative spacing but fine for now
+
+    // Number of samples to generate for this triangle
+    const int32_t numU      = ceil((e1.length() + spacing) / spacing);
+    const int32_t numV      = ceil((e2.length() + spacing) / spacing);
+    const int32_t numVoxels = numU * numV;
+
+    // Store a zero in the first element so we can do a cumulative sum later
+    outNumSamplesPerTri[eidx + 1] = numVoxels;
+    if (eidx == 0) {
+        outNumSamplesPerTri[0] = 0;
+    }
+}
+
+template <typename ScalarF,
+          typename ScalarI,
+          template <typename T, int32_t D>
+          typename TensorAccessor>
+__global__ __launch_bounds__(DEFAULT_BLOCK_DIM) void
+generateSurfaceSamples(const VoxelCoordTransform *transforms,
+                       const JaggedRAcc64<ScalarF, 2> vertices,
+                       const JaggedRAcc64<ScalarI, 2> triangles,
+                       const TorchRAcc64<int64_t, 1> cumSamplesPerTri,
+                       TensorAccessor<int32_t, 2> outIJK,
+                       TensorAccessor<fvdb::JIdxType, 1> outJIdx) {
+    using Vec3F = nanovdb::math::Vec3<ScalarF>;
+    using Vec3I = nanovdb::math::Vec3<ScalarI>;
+
+    const int64_t tid     = int64_t(threadIdx.x) + int64_t(blockIdx.x) * int64_t(blockDim.x);
+    const int64_t numTris = cumSamplesPerTri.size(0) - 1; // Total number of triangles in the mesh
+    const int64_t totalSamples =
+        cumSamplesPerTri[numTris]; // Total number of ijk samples we're going to generate
+
+    if (tid >= totalSamples) {
+        return;
+    }
+
+    // Binary search for the triangle index that we're in
+    // If most threads in a warp are in the same triangle, there is no execution divergence,
+    // and this should be pretty fast
+    // cumSamplesPerTri has size numTris + 1
+    // startIdx and endIdx are the ranges to search for the triangle index
+    int64_t triIdx = numTris / 2;
+    {
+        int64_t startIdx  = 0;
+        int64_t endIdx    = numTris - 1;
+        int64_t rangeSize = endIdx - startIdx;
+        int32_t count     = 0;
+        while (count < 8192) {
+            const int64_t rangeStart = cumSamplesPerTri[triIdx];
+            const int64_t rangeEnd   = cumSamplesPerTri[triIdx + 1];
+
+            if (tid < rangeStart) {
+                endIdx = triIdx;
+            } else if (tid >= rangeEnd) {
+                startIdx = triIdx;
+            } else {
+                break;
+            }
+            triIdx    = startIdx + (rangeSize / 2);
+            rangeSize = endIdx - startIdx;
+            count += 1;
+        }
+
+        if (count == 8192) {
+            printf("Binary search failed. This is a big deal\n");
+            return;
+        }
+        if (triIdx >= numTris) {
+            printf("Triangle index out of bounds (overflow). This is a big deal\n");
+            return;
+        }
+        if (triIdx < 0) {
+            printf("Triangle index out of bounds (negative). This is a big deal\n");
+            return;
+        }
+    }
+
+    // Compute the voxel coordinate vertices and edges of the triangle containing this sample
+    const fvdb::JIdxType triJIdx        = triangles.batchIdx(triIdx);
+    const VoxelCoordTransform tx        = transforms[triJIdx];
+    const TorchRAcc64<ScalarI, 2> faces = triangles.data();
+    const TorchRAcc64<ScalarF, 2> verts = vertices.data();
+
+    // Voxel space vertices of the triangle containing this sample
+    const int64_t off = vertices.offsetStart(triJIdx);
+    const Vec3F v1    = tx.apply(verts[off + faces[triIdx][0]][0],
+                              verts[off + faces[triIdx][0]][1],
+                              verts[off + faces[triIdx][0]][2]);
+    const Vec3F v2    = tx.apply(verts[off + faces[triIdx][1]][0],
+                              verts[off + faces[triIdx][1]][1],
+                              verts[off + faces[triIdx][1]][2]);
+    const Vec3F v3    = tx.apply(verts[off + faces[triIdx][2]][0],
+                              verts[off + faces[triIdx][2]][1],
+                              verts[off + faces[triIdx][2]][2]);
+
+    // Voxel space edges of the triangle containing this sample
+    const Vec3F e1        = v2 - v1;
+    const Vec3F e2        = v3 - v1;
+    const ScalarF spacing = sqrt(3.0) / 3.0; // This is very conservative spacing but fine for now
+
+    // Number of points to generate per axis
+    const int32_t numU = ceil((e1.length() + spacing) / spacing);
+    const int32_t numV = ceil((e2.length() + spacing) / spacing);
+
+    // Compute the position of this sample in the triangle (reflecting it if necessary)
+    const int64_t base        = cumSamplesPerTri[triIdx];
+    const int64_t offsetInTri = tid - cumSamplesPerTri[triIdx];
+    const int64_t i0          = offsetInTri / numV;
+    const int64_t j0          = offsetInTri - i0 * numV;
+    ScalarF u                 = ScalarF(i0) / (ScalarF(max(numU - 1, 1)));
+    ScalarF v                 = ScalarF(j0) / (ScalarF(max(numV - 1, 1)));
+    if (u + v >= 1.0) {
+        u = 1.0 - u;
+        v = 1.0 - v;
+    }
+    const Vec3F sample       = v1 + e1 * u + e2 * v;
+    const nanovdb::Coord ijk = sample.round();
+
+    // Round the sample down to the nearest voxel and write it out
+    outIJK[tid][0] = ijk[0];
+    outIJK[tid][1] = ijk[1];
+    outIJK[tid][2] = ijk[2];
+    outJIdx[tid]   = triJIdx;
+}
+
+namespace {
+
+template <torch::DeviceType>
+JaggedTensor dispatchIJKForMesh(const JaggedTensor &meshVertices,
+                                const JaggedTensor &meshFaces,
+                                const std::vector<VoxelCoordTransform> &transforms);
+
+template <>
+JaggedTensor
+dispatchIJKForMesh<torch::kCUDA>(const JaggedTensor &meshVertices,
+                                 const JaggedTensor &meshFaces,
+                                 const std::vector<VoxelCoordTransform> &transforms) {
+    TORCH_CHECK(meshVertices.device().is_cuda(), "GridBatchData must be on CUDA device");
+    TORCH_CHECK(meshVertices.device().has_index(), "GridBatchData must have a valid index");
+    TORCH_CHECK(meshFaces.device().is_cuda(), "GridBatchData must be on CUDA device");
+    TORCH_CHECK(meshFaces.device().has_index(), "GridBatchData must have a valid index");
+
+    const c10::cuda::CUDAGuard device_guard(meshFaces.device());
+
+    RAIIRawDeviceBuffer<VoxelCoordTransform> transformsDVec(transforms.size(),
+                                                            meshVertices.device());
+    transformsDVec.setData((VoxelCoordTransform *)transforms.data(), true /* blocking */);
+    const VoxelCoordTransform *transformDevPtr = transformsDVec.devicePtr;
+
+    const torch::TensorOptions optsI32 =
+        torch::TensorOptions().dtype(torch::kInt32).device(meshFaces.device());
+    const torch::TensorOptions optsJIdx =
+        torch::TensorOptions().dtype(fvdb::JIdxScalarType).device(meshFaces.device());
+
+    return AT_DISPATCH_V2(
+        meshFaces.scalar_type(),
+        "ijkForMesh",
+        AT_WRAP([&]() {
+            using scalar_i = scalar_t;
+            return AT_DISPATCH_V2(
+                meshVertices.scalar_type(),
+                "countVoxelsPerTriToCheckVertices",
+                AT_WRAP([&]() {
+                    using scalar_f = scalar_t;
+
+                    // First count the total number of samples to generate in each triangle
+                    torch::Tensor samplesPerTri =
+                        torch::empty({meshFaces.jdata().size(0) + 1}, optsI32);
+                    auto samplesPerTriAcc =
+                        samplesPerTri.packed_accessor64<int32_t, 1, torch::RestrictPtrTraits>();
+                    auto verticesAcc =
+                        meshVertices.packed_accessor64<scalar_f, 2, torch::RestrictPtrTraits>();
+                    auto facesAcc =
+                        meshFaces.packed_accessor64<scalar_i, 2, torch::RestrictPtrTraits>();
+                    auto cb = [=] __device__(int32_t bidx,
+                                             int32_t eidx,
+                                             int32_t cidx,
+                                             JaggedRAcc64<scalar_i, 2> acc) {
+                        countVoxelsPerTriToCheck<scalar_f, scalar_i>(
+                            bidx, eidx, transformDevPtr, verticesAcc, facesAcc, samplesPerTriAcc);
+                    };
+                    forEachJaggedElementChannelCUDA<scalar_i, 2, 1024>(1, meshFaces, cb);
+
+                    // Compute the cumulative sum of the number of samples per triangle so each
+                    // thread can figure out which triangle it's in
+                    torch::Tensor samplesPerTriCumSum = samplesPerTri.cumsum(0);
+                    auto samplesPerTriCumSumAcc =
+                        samplesPerTriCumSum
+                            .packed_accessor64<int64_t, 1, torch::RestrictPtrTraits>();
+                    const int64_t totalSurfaceSamples = samplesPerTriCumSum[-1].item<int64_t>();
+
+                    // Now write out the surface samples
+                    const int64_t numBlocks = GET_BLOCKS(totalSurfaceSamples, DEFAULT_BLOCK_DIM);
+                    torch::Tensor outIJK    = torch::empty({totalSurfaceSamples, 3}, optsI32);
+                    torch::Tensor outJidx   = torch::empty({totalSurfaceSamples}, optsJIdx);
+                    cudaStream_t stream =
+                        c10::cuda::getCurrentCUDAStream(meshFaces.device().index()).stream();
+
+                    // packed_accessor64 (64-bit indexing) handles outputs above 2^31 elements,
+                    // and the kernel indexes with int64 tids, so a single launch path is correct
+                    // at every size.
+                    auto outIJKAcc =
+                        outIJK.packed_accessor64<int32_t, 2, torch::RestrictPtrTraits>();
+                    auto outJidxKAcc =
+                        outJidx.packed_accessor64<fvdb::JIdxType, 1, torch::RestrictPtrTraits>();
+                    generateSurfaceSamples<scalar_f, scalar_i, TorchRAcc64>
+                        <<<numBlocks, DEFAULT_BLOCK_DIM, 0, stream>>>(transformDevPtr,
+                                                                      verticesAcc,
+                                                                      facesAcc,
+                                                                      samplesPerTriCumSumAcc,
+                                                                      outIJKAcc,
+                                                                      outJidxKAcc);
+                    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+                    return fvdb::JaggedTensor::from_data_indices_and_list_ids_unsafe(
+                        outIJK,
+                        outJidx,
+                        meshFaces.jlidx(),
+                        meshFaces.num_tensors(),
+                        meshFaces.num_outer_lists());
+                }),
+                AT_EXPAND(AT_FLOATING_TYPES),
+                c10::kHalf);
+        }),
+        AT_EXPAND(AT_INTEGRAL_TYPES));
+}
+
+} // namespace
+
+JaggedTensor
+ijkForMesh(const JaggedTensor &meshVertices,
+           const JaggedTensor &meshFaces,
+           const std::vector<VoxelCoordTransform> &transforms) {
+    TORCH_CHECK(meshVertices.device().is_cuda(), "ijkForMesh only supports CUDA");
+    return dispatchIJKForMesh<torch::kCUDA>(meshVertices, meshFaces, transforms);
+}
+
+} // namespace ops
+} // namespace detail
+} // namespace fvdb

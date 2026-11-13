@@ -1,0 +1,73 @@
+# Copyright Contributors to the OpenVDB Project
+# SPDX-License-Identifier: Apache-2.0
+
+name: Issue Triage
+
+on:
+  issues:
+    types: [opened, reopened]
+
+# Labels every new or reopened issue `triage`, and additionally `external`
+# when the author does not have write access to this repository.
+#
+# The built-in GITHUB_TOKEN is enough: labeling needs issues: write, and the
+# collaborator-permission lookup needs only the token's implicit metadata
+# read access. No personal access token or other secret is used.
+
+permissions:
+  issues: write
+
+jobs:
+  triage:
+    if: github.repository_owner == 'openvdb'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Add triage label
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --add-label "triage"
+
+      # "External" means the author cannot push to this repository. The API
+      # reports the effective permission as admin, write, read or none
+      # (maintain is reported as write, triage as read), including access
+      # granted through teams.
+      - name: Check author's repository access
+        id: access
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          AUTHOR: ${{ github.event.issue.user.login }}
+        run: |
+          set -uo pipefail
+          if ! perm=$(gh api "repos/${REPO}/collaborators/${AUTHOR}/permission" --jq '.permission' 2>"${RUNNER_TEMP}/lookup.err"); then
+            # A deleted or renamed account (for example on a reopened old
+            # issue) no longer resolves. That author is certainly not a
+            # maintainer, so label the issue external rather than failing.
+            if grep -q "HTTP 404" "${RUNNER_TEMP}/lookup.err"; then
+              echo "${AUTHOR}: account not found; treating as external"
+              echo "external=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            cat "${RUNNER_TEMP}/lookup.err" >&2
+            echo "::error::Permission lookup failed for ${AUTHOR}"
+            exit 1
+          fi
+          echo "${AUTHOR}: ${perm}"
+          case "$perm" in
+            admin|write) echo "external=false" >> "$GITHUB_OUTPUT" ;;
+            read|none)   echo "external=true"  >> "$GITHUB_OUTPUT" ;;
+            *)           echo "::error::Unexpected permission '${perm}' for ${AUTHOR}"
+                         exit 1 ;;
+          esac
+
+      - name: Add external label
+        if: steps.access.outputs.external == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --add-label "external"

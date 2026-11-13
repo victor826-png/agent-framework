@@ -1,0 +1,122 @@
+Examples/MeshSDF
+----------------
+
+This folder shows how to turn a triangulated surface mesh (loaded from an STL/PLY/OBJ/VTK file)
+into a signed distance function, and compares three different ways of evaluating it.
+
+A signed distance function returns, for any point in space, the distance to the nearest point on
+the mesh's surface, signed by whether the query point is inside or outside the surface. This only
+makes sense if the mesh is *watertight* (it has no holes or gaps) and *consistently oriented* (its
+triangles all wind the same way, so "inside" is unambiguous everywhere) -- see
+[Geometry representations](https://rmrsk.github.io/EBGeometry/GeometryRepresentations.html) for the underlying
+theory.
+
+Computing that distance exactly requires checking every triangle in the mesh, which becomes slow
+as the mesh grows -- the cost scales linearly with the number of triangles. This example compares
+that direct, brute-force evaluation against two accelerated representations that instead organize
+the mesh's triangles into a *bounding volume hierarchy*: a tree of nested bounding boxes that lets
+a query skip the (usually large majority of) triangles whose enclosing box is nowhere near the
+query point. The third representation additionally evaluates several candidate triangles at once
+using your CPU's SIMD (vector) instructions. All three give identical results for a watertight
+mesh; the example measures how much faster each accelerated representation is in practice, over
+many random query points.
+
+Note that the achievable speedup depends on both the geometry and where you query it: a
+tessellated sphere, for example, has a "blind spot" at its center where every point on the surface
+is roughly equidistant, so even a bounding volume hierarchy ends up visiting most of the
+triangles for a query placed there.
+
+Building
+--------
+
+This example is standalone and can be built in three ways. Each needs the path
+to the EBGeometry root -- the directory that contains `EBGeometry.hpp` -- which
+is two levels up from this folder (`../..`) when building in place. See
+[Direct compilation](https://rmrsk.github.io/EBGeometry/Building.html#sec-buildingdirectcompile),
+[Building with GNU Make](https://rmrsk.github.io/EBGeometry/Building.html#sec-buildinggnumake), and
+[Building with CMake](https://rmrsk.github.io/EBGeometry/Building.html#sec-buildingcmake) in the user
+documentation for more detail on each approach.
+
+**CMake**
+
+    cmake -S . -B build
+    cmake --build build
+
+The binary is `MeshSDF.ex`, in this same directory (same as the other two methods below). Build in single precision, against a library
+in a different location, or with `EBGEOMETRY_EXPECT()` runtime assertions enabled, with cache variables:
+
+    cmake -S . -B build -DEBGEOMETRY_PRECISION=float -DEBGEOMETRY_HOME=/path/to/EBGeometry -DEBGEOMETRY_ENABLE_ASSERTIONS=ON
+
+**GNU make**
+
+    make
+
+This produces `./MeshSDF.ex`. Override the defaults on the command line:
+
+    make PRECISION=float EBGEOMETRY_HOME=/path/to/EBGeometry ASSERTIONS=ON
+
+**Directly with a compiler**
+
+    g++ -std=c++17 -O3 -march=native -I../.. main.cpp -o MeshSDF.ex -pthread
+
+Add `-DEBGEOMETRY_PRECISION=float` for single precision, or `-DEBGEOMETRY_ENABLE_ASSERTIONS` to enable
+`EBGEOMETRY_EXPECT()` runtime assertion checks.
+
+**For a GPU**
+
+The same source also builds for a GPU, and its last section then runs in a kernel (a GPU build
+without a visible GPU skips that part):
+
+    make GPU=HIP HIP_ARCH=gfx90a                                  # or GPU=CUDA CUDA_ARCH=sm_80
+    cmake -S . -B build -DEBGEOMETRY_EXAMPLE_GPU=HIP              # or CUDA
+    hipcc -std=c++17 -O3 -x hip --offload-arch=gfx90a -I../.. main.cpp -o MeshSDF.ex
+
+See [GPU builds](https://rmrsk.github.io/EBGeometry/Examples.html#sec-examplesgpu) in the user documentation.
+
+**With the viewer**
+
+At the end the example opens a window on the mesh (`EBGeometry::Render::view()`). The window needs
+SDL2 (for example `libsdl2-dev`, or `brew install sdl2`) and is built only on request:
+
+    make VIEWER=SDL2
+    cmake -S . -B build -DEBGEOMETRY_VIEWER=SDL2
+    g++ -std=c++17 -O3 -march=native -DEBGEOMETRY_VIEWER_SDL2 $(sdl2-config --cflags) -I../.. main.cpp -o MeshSDF.ex $(sdl2-config --libs) -pthread
+
+Without it, `view()` prints a line saying how to build it and returns.
+
+Running
+-------
+
+Run from this directory so the default mesh path resolves:
+
+    ./MeshSDF.ex
+    ./MeshSDF.ex ../../common-3d-test-models/data/cow.obj
+
+With no argument the example loads `armadillo.obj` from the
+`common-3d-test-models` submodule, so make sure it is checked out
+(`git submodule update --init`; see
+[Obtaining EBGeometry](https://rmrsk.github.io/EBGeometry/ObtainingEBGeometry.html) for details). You can pass
+the path to any watertight, triangulated STL/PLY/OBJ/VTK file instead.
+
+The program prints the mesh's face count and bounding box, then the time per query of each of the
+three representations over the same random points, with the speedup of the two BVH-backed ones over
+the flat scan, the values at the first few points (the same in all three), and which face is nearest
+the first point. Then it evaluates the `TriMeshSDF` at those points through
+`EBGeometry::GPU::transform`: in a kernel in a GPU build, in a host loop otherwise.
+
+Finally it opens the viewer on the `TriMeshSDF`, if built with it, and waits until the window is
+closed. Drag to orbit and scroll to zoom; the window lists its other keys (see
+[the viewer's keys](https://rmrsk.github.io/EBGeometry/ImplemRender.html#sec-viewerkeys)).
+
+A surface seen from inside the solid is drawn red: that is what the inside looks like through the
+section plane's cut, and what a mesh whose faces are wound the wrong way looks like from outside.
+The `TriMeshSDF` is ray traced (rays through its BVH, tested against its triangles), so the window
+follows the mouse: a quick preview while the camera moves, refined to the full frame once it rests.
+In a GPU build the window renders on the GPU (`G` switches to the CPU and back). Build that in single
+precision, since many GPUs are much slower in double precision:
+
+    make GPU=CUDA VIEWER=SDL2 PRECISION=float
+
+`--no-view` skips the window (ctest passes it), as does running without a display:
+
+    ./MeshSDF.ex --no-view

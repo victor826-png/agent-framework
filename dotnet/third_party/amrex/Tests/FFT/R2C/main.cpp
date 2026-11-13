@@ -1,0 +1,365 @@
+#include <AMReX_FFT.H> // Put this at the top for testing
+
+#include <AMReX.H>
+#include <AMReX_MultiFab.H>
+#include <AMReX_ParReduce.H>
+#include <AMReX_ParmParse.H>
+#include <AMReX_PlotFileUtil.H>
+#include <string>
+
+using namespace amrex;
+
+namespace {
+// Communication strategy for the transposes, from the input comm_strategy.
+FFT::Info test_info ()
+{
+    FFT::Info info{};
+    ParmParse pp;
+    std::string s;
+    if (pp.query("comm_strategy", s)) {
+        info.setCommStrategy(amrex::getEnumCaseInsensitive<FFT::CommStrategy>(s));
+    }
+    return info;
+}
+}
+
+int main (int argc, char* argv[])
+{
+    amrex::Initialize(argc, argv);
+    {
+        BL_PROFILE("main");
+
+        AMREX_D_TERM(int n_cell_x = 128;,
+                     int n_cell_y = 32;,
+                     int n_cell_z = 64);
+
+        AMREX_D_TERM(int max_grid_size_x = 64;,
+                     int max_grid_size_y = 32;,
+                     int max_grid_size_z = 32);
+
+        AMREX_D_TERM(Real prob_lo_x = 0.;,
+                     Real prob_lo_y = 0.;,
+                     Real prob_lo_z = 0.);
+        AMREX_D_TERM(Real prob_hi_x = 1.;,
+                     Real prob_hi_y = 1.;,
+                     Real prob_hi_z = 1.);
+
+        {
+            ParmParse pp;
+            AMREX_D_TERM(pp.query("n_cell_x", n_cell_x);,
+                         pp.query("n_cell_y", n_cell_y);,
+                         pp.query("n_cell_z", n_cell_z));
+            AMREX_D_TERM(pp.query("max_grid_size_x", max_grid_size_x);,
+                         pp.query("max_grid_size_y", max_grid_size_y);,
+                         pp.query("max_grid_size_z", max_grid_size_z));
+        }
+
+        Box domain(IntVect(0),IntVect(AMREX_D_DECL(n_cell_x-1,n_cell_y-1,n_cell_z-1)));
+        BoxArray ba(domain);
+        ba.maxSize(IntVect(AMREX_D_DECL(max_grid_size_x,
+                                        max_grid_size_y,
+                                        max_grid_size_z)));
+        DistributionMapping dm(ba);
+
+        Geometry geom;
+        {
+            geom.define(domain,
+                        RealBox(AMREX_D_DECL(prob_lo_x,prob_lo_y,prob_lo_z),
+                                AMREX_D_DECL(prob_hi_x,prob_hi_y,prob_hi_z)),
+                        CoordSys::cartesian, {AMREX_D_DECL(1,1,1)});
+        }
+        auto const& dx = geom.CellSizeArray();
+
+        MultiFab mf(ba,dm,1,0);
+        auto const& ma = mf.arrays();
+        ParallelFor(mf, [=] AMREX_GPU_DEVICE (int b, int i, int j, int k)
+        {
+            AMREX_D_TERM(Real x = (Real(i)+0.5_rt) * dx[0] - 0.5_rt;,
+                         Real y = (Real(j)+0.5_rt) * dx[1] - 0.5_rt;,
+                         Real z = (Real(k)+0.5_rt) * dx[2] - 0.5_rt);
+            ma[b](i,j,k) = std::exp(-10._rt*
+                (AMREX_D_TERM(x*x*1.05_rt, + y*y*0.90_rt, + z*z)));
+        });
+
+        MultiFab mf2(ba,dm,1,0);
+
+        auto scaling = Real(1) / Real(geom.Domain().d_numPts());
+
+        {
+            cMultiFab cmf;
+
+            // forward
+            {
+                FFT::R2C<Real,FFT::Direction::forward> r2c
+                    (geom.Domain(), test_info().setDomainStrategy(FFT::DomainStrategy::pencil));
+                auto const& [cba, cdm] = r2c.getSpectralDataLayout();
+                cmf.define(cba, cdm, 1, 0);
+                r2c.forward(mf,cmf);
+            }
+
+            // backward
+            {
+                FFT::R2C<Real,FFT::Direction::backward> r2c
+                    (geom.Domain(), test_info().setDomainStrategy(FFT::DomainStrategy::pencil));
+                r2c.backward(cmf,mf2);
+            }
+
+            auto const& ma2 = mf2.arrays();
+            ParallelFor(mf2, [=] AMREX_GPU_DEVICE (int b, int i, int j, int k)
+            {
+                ma2[b](i,j,k) = ma[b](i,j,k) - ma2[b](i,j,k)*scaling;
+            });
+
+            auto error = mf2.norminf();
+            amrex::Print() << "  Expected to be close to zero: " << error << "\n";
+#ifdef AMREX_USE_FLOAT
+            auto eps = 1.e-6F;
+#else
+            auto eps = 1.e-13;
+#endif
+            AMREX_ALWAYS_ASSERT(error < eps);
+        }
+
+        mf2.setVal(std::numeric_limits<Real>::max());
+
+        { // forward and backward
+            FFT::R2C<Real,FFT::Direction::both> r2c
+                (geom.Domain(), test_info().setDomainStrategy(FFT::DomainStrategy::slab));
+            r2c.forwardThenBackward(mf, mf2,
+                                    [=] AMREX_GPU_DEVICE (int, int, int, auto& sp)
+            {
+                sp *= scaling;
+            });
+
+            MultiFab::Subtract(mf2, mf, 0, 0, 1, 0);
+
+            auto error = mf2.norminf();
+            amrex::Print() << "  Expected to be close to zero: " << error << "\n";
+#ifdef AMREX_USE_FLOAT
+            auto eps = 1.e-6F;
+#else
+            auto eps = 1.e-13;
+#endif
+            AMREX_ALWAYS_ASSERT(error < eps);
+        }
+
+        {
+            Real error = 0;
+            BaseFab<GpuComplex<Real>> cfab;
+            for (MFIter mfi(mf); mfi.isValid(); ++mfi)
+            {
+                auto& fab = mf[mfi];
+                auto& fab2 = mf2[mfi];
+                Box const& box = fab.box();
+                {
+                    FFT::LocalR2C<Real,FFT::Direction::both> fft(box.length());
+                    Box cbox(IntVect(0), fft.spectralSize() - 1);
+                    cfab.resize(cbox);
+                    fft.forward(fab.dataPtr(), cfab.dataPtr());
+                    fft.backward(cfab.dataPtr(), fab2.dataPtr());
+                    auto fac = fft.scalingFactor();
+                    fab2.template xpay<RunOn::Device>(-fac, fab, box, box, 0, 0, 1);
+                    auto e = fab2.template norm<RunOn::Device>(0);
+                    error = std::max(e,error);
+                }
+                {
+                    FFT::LocalR2C<Real,FFT::Direction::forward> fft(box.length());
+                    fft.forward(fab.dataPtr(), cfab.dataPtr());
+                }
+                {
+                    FFT::LocalR2C<Real,FFT::Direction::backward> fft(box.length());
+                    fft.backward(cfab.dataPtr(), fab2.dataPtr());
+                    auto fac = fft.scalingFactor();
+                    fab2.template xpay<RunOn::Device>(-fac, fab, box, box, 0, 0, 1);
+                    auto e = fab2.template norm<RunOn::Device>(0);
+                    error = std::max(e,error);
+                }
+            }
+
+            ParallelDescriptor::ReduceRealMax(error);
+            amrex::Print() << "  Expected to be close to zero: " << error << "\n";
+#ifdef AMREX_USE_FLOAT
+            auto eps = 1.e-6F;
+#else
+            auto eps = 1.e-13;
+#endif
+            AMREX_ALWAYS_ASSERT(error < eps);
+        }
+
+        // Test raw pointer interface
+        {
+            auto sba = amrex::decompose(domain, ParallelDescriptor::NProcs());
+            DistributionMapping sdm{sba};
+            MultiFab smf(sba,sdm,1,0);
+            smf.ParallelCopy(mf);
+
+            Box cdomain(IntVect(0),IntVect(AMREX_D_DECL(domain.length(0)/2,
+                                                        domain.length(1)-1,
+                                                        domain.length(2)-1)));
+            auto sba_c = amrex::decompose(cdomain, ParallelDescriptor::NProcs());
+            DistributionMapping sdm_c{sba_c};
+            FabArray<BaseFab<GpuComplex<Real>>> smf_c(sba_c,sdm_c,1,0);
+
+            auto domain_size = domain.length().toArray();
+            FFT::R2C<Real,FFT::Direction::both> r2c(domain_size);
+
+            Real* preal = nullptr;
+            std::array<int,AMREX_SPACEDIM> local_start{AMREX_D_DECL(0,0,0)};
+            std::array<int,AMREX_SPACEDIM> local_size{AMREX_D_DECL(0,0,0)};
+            auto const& imap = smf.IndexArray();
+            AMREX_ALWAYS_ASSERT(imap.size() <= 1);
+            if (imap.size() == 1) {
+                preal = smf[imap[0]].dataPtr();
+                auto const& box = sba[imap[0]];
+                for (int idim = 0; idim < AMREX_SPACEDIM; ++idim) {
+                    local_start[idim] = box.smallEnd(idim);
+                    local_size[idim] = box.length(idim);
+                }
+            }
+            r2c.setLocalDomain(local_start, local_size);
+
+            GpuComplex<Real>* pcomplex = nullptr;
+            std::array<int,AMREX_SPACEDIM> local_start_c{AMREX_D_DECL(0,0,0)};
+            std::array<int,AMREX_SPACEDIM> local_size_c{AMREX_D_DECL(0,0,0)};
+            auto const& imap_c = smf_c.IndexArray();
+            AMREX_ALWAYS_ASSERT(imap_c.size() <= 1);
+            if (imap_c.size() == 1) {
+                pcomplex = smf_c[imap_c[0]].dataPtr();
+                auto const& box = sba_c[imap_c[0]];
+                for (int idim = 0; idim < AMREX_SPACEDIM; ++idim) {
+                    local_start_c[idim] = box.smallEnd(idim);
+                    local_size_c[idim] = box.length(idim);
+                }
+            }
+            r2c.setLocalSpectralDomain(local_start_c, local_size_c);
+
+            r2c.forward(preal, pcomplex);
+
+            amrex::Scale(smf_c, scaling, 0, 1, 0);
+
+            r2c.backward(pcomplex, preal);
+
+            mf2.ParallelCopy(smf);
+            MultiFab::Subtract(mf2, mf, 0, 0, 1, 0);
+
+            auto error = mf2.norminf();
+            amrex::Print() << "  Expected to be close to zero: " << error << "\n";
+#ifdef AMREX_USE_FLOAT
+            auto eps = 1.e-6F;
+#else
+            auto eps = 1.e-13;
+#endif
+            AMREX_ALWAYS_ASSERT(error < eps);
+        }
+
+        // Test face MultiFabs
+        {
+            FFT::R2C<Real> r2c(geom.Domain());
+
+            for (int idim = 0; idim < AMREX_SPACEDIM; ++idim) {
+                BoxArray fba = amrex::convert(ba, IntVect::TheDimensionVector(idim));
+                MultiFab face_mf(fba, dm, 1, 0);
+                MultiFab face_mf2(fba, dm, 1, 0);
+
+                auto const& face_ma = face_mf.arrays();
+                ParallelFor(face_mf, [=] AMREX_GPU_DEVICE (int b, int i, int j, int k)
+                {
+                    AMREX_D_TERM(int ii = (i == n_cell_x) ? 0 : i;,
+                                 int jj = (j == n_cell_y) ? 0 : j;,
+                                 int kk = (k == n_cell_z) ? 0 : k);
+                    AMREX_D_TERM(Real x = Real(ii) * dx[0] - 0.5_rt;,
+                                 Real y = Real(jj) * dx[1] - 0.5_rt;,
+                                 Real z = Real(kk) * dx[2] - 0.5_rt);
+                    face_ma[b](i,j,k) = std::exp(-10._rt*
+                        (AMREX_D_TERM(x*x*1.05_rt, + y*y*0.90_rt, + z*z)));
+                });
+
+                auto const& [cba, cdm] = r2c.getSpectralDataLayout();
+                cMultiFab cmf(cba, cdm, 1, 0);
+                r2c.forward(face_mf, cmf);
+                amrex::Scale(cmf, scaling, 0, 1, 0);
+
+                constexpr Real sentinel = -1.2345e30_rt;
+                face_mf2.setVal(sentinel);
+                r2c.backward(cmf, face_mf2);
+
+                auto const& face_ma2 = face_mf2.const_arrays();
+
+                auto error = ParReduce(TypeList<ReduceOpMax>{}, TypeList<Real>{}, face_mf,
+                    IntVect(0), [=] AMREX_GPU_DEVICE (int b, int i, int j, int k)
+                        -> GpuTuple<Real>
+                {
+                    Real e = std::abs(face_ma2[b](i,j,k) - face_ma[b](i,j,k));
+                    return {e};
+                });
+                ParallelDescriptor::ReduceRealMax(error);
+                amrex::Print() << "  Face MultiFab dir " << idim
+                               << " expected to be close to zero: " << error << "\n";
+#ifdef AMREX_USE_FLOAT
+                auto eps = 1.e-6F;
+#else
+                auto eps = 1.e-13;
+#endif
+                AMREX_ALWAYS_ASSERT(error < eps);
+            }
+        }
+
+#if (AMREX_SPACEDIM > 1)
+        // Degenerate domains.  SubHelper reorders the axes, so scalingFactor
+        // must follow the directions that are actually transformed.
+        {
+            Vector<Box> domains
+#if (AMREX_SPACEDIM == 2)
+                {Box(IntVect(0),IntVect(0,31)),
+                 Box(IntVect(0),IntVect(31,0))};
+#else
+                {Box(IntVect(0),IntVect(0,31,15)),
+                 Box(IntVect(0),IntVect(31,0,15)),
+                 Box(IntVect(0),IntVect(31,15,0))};
+#endif
+            Vector<std::pair<std::string,FFT::Info>> modes;
+            modes.emplace_back("plain", test_info());
+            modes.emplace_back("oned_mode", test_info().setOneDMode(true));
+#if (AMREX_SPACEDIM == 3)
+            modes.emplace_back("twod_mode", test_info().setTwoDMode(true));
+            // Both flags, like FFT::PoissonHybrid sets for a degenerate domain.
+            modes.emplace_back("oned+twod_mode",
+                               test_info().setOneDMode(true).setTwoDMode(true));
+#endif
+
+            for (auto const& dom : domains) {
+            for (auto const& [tag, info] : modes) {
+                BoxArray dba(dom);
+                DistributionMapping ddm(dba);
+                MultiFab dmf(dba,ddm,1,0), dmf2(dba,ddm,1,0);
+                auto const& dma = dmf.arrays();
+                ParallelFor(dmf, [=] AMREX_GPU_DEVICE (int b, int i, int j, int k)
+                {
+                    dma[b](i,j,k) = std::sin(0.3_rt*Real(i) + 0.1_rt)
+                        * std::cos(0.7_rt*Real(j) + 0.2_rt)
+                        * std::sin(0.5_rt*Real(k) + 0.3_rt);
+                });
+
+                FFT::R2C<Real,FFT::Direction::both> r2c(dom, info);
+                auto const& [dcba, dcdm] = r2c.getSpectralDataLayout();
+                cMultiFab dcmf(dcba, dcdm, 1, 0);
+                r2c.forward(dmf, dcmf);
+                r2c.backward(dcmf, dmf2);
+
+                auto const dscaling = r2c.scalingFactor();
+                MultiFab::Saxpy(dmf, -dscaling, dmf2, 0, 0, 1, IntVect(0));
+                auto error = dmf.norminf();
+                amrex::Print() << "  Degenerate " << dom << " " << tag
+                               << ", expected to be close to zero: " << error << "\n";
+#ifdef AMREX_USE_FLOAT
+                auto eps = 1.e-6F;
+#else
+                auto eps = 1.e-13;
+#endif
+                AMREX_ALWAYS_ASSERT(error < eps);
+            }}
+        }
+#endif
+    }
+    amrex::Finalize();
+}

@@ -1,0 +1,139 @@
+Welcome to ƒVDB!
+=================
+
+ƒVDB is a Python library developed and maintained by NVIDIA, containing a collection of data structures and algorithms for building high-performance and large-domain
+spatial applications using `NanoVDB <https://dl.acm.org/doi/abs/10.1145/3450623.3464653>`_ on the GPU
+in `PyTorch <https://pytorch.org/>`_.
+Applications of fVDB include 3D deep learning, computer graphics/vision, robotics, and scientific computing.
+
+.. raw:: html
+
+  <video autoplay loop controls muted width="90%" style="display: block; margin: 0 auto;">
+     <source src="https://fvdb-data.s3.us-east-2.amazonaws.com/fvdb-reality-capture/fvdb_intro_480p.mp4" type="video/mp4" />
+  </video>
+
+|
+
+ƒVDB aims to be production ready with a focus on robustness, usability, and extensibility.
+It is designed to be easily integrated into existing pipelines and workflows, and to support a
+wide range of use cases and applications. To this end, ƒVDB has a minimal set of dependencies and
+is open source under the Apache 2.0 license as part of the `The Academy Software Foundation's
+OpenVDB project <https://www.openvdb.org>`_.  Contributions and feedback from the community are welcome
+to ƒVDB's `GitHub repository <https://github.com/openvdb/fvdb-core>`_.
+
+
+Features
+--------
+
+ƒVDB provides the following key features:
+
+-   A sparse volumetric grid data structure optimized for GPU memory efficiency and performance.
+-   A jagged tensor data structure for efficient representation of sparse, non-uniform data on the GPU.
+-   A suite of GPU-accelerated algorithms for volumetric data manipulation, ray tracing, and volume rendering.
+-   A state of the art visualizer capable of streaming massive volumetric datasets to a web browser or Jupyter notebook.
+-   Modular neural network components for building 3D deep learning models that scale to large input sizes.
+-   Seamless integration with PyTorch for easy use in deep learning workflows.
+
+Getting Started
+---------------
+
+You can try the `TEACHME <https://github.com/openvdb/fvdb-core/tree/main/docs/TEACHME>`_ interactive lessons,
+designed to be used with an LLM coding agent (Claude Code, Cursor, or similar) that teaches you the ƒVDB API
+interactively. Just prompt: ``Read docs/TEACHME and teach me how to use fvdb-core.``
+
+The videos below show ƒVDB being used for large-scale 3D reconstruction, simulation, and interactive visualization.
+
+.. raw:: html
+
+   <p style="text-align: center; font-weight: bold; font-style: italic; text-decoration: underline; font-size: medium; text-decoration-skip-ink: none; margin-bottom: 0.5em;">
+   ƒVDB being used to reconstruct radiance (25 million splats) fields and TSDF volumes (100 million voxels) from images and points</p>
+  <video autoplay loop controls muted width="90%" style="display: block; margin: 0 auto;">
+     <source src="https://fvdb-data.s3.us-east-2.amazonaws.com/fvdb-reality-capture/spot_airport_480p.mp4" type="video/mp4" />
+  </video>
+
+   <br>
+   <p style="text-align: center; font-weight: bold; font-style: italic; text-decoration: underline; font-size: medium; text-decoration-skip-ink: none; margin-bottom: 0.5em;">
+   ƒVDB being used to process a sparse SDF on a grid with 181 million voxels. Visualized in a browser.</p>
+  <video autoplay loop controls muted width="90%" style="display: block; margin: 0 auto;">
+     <source src="https://fvdb-data.s3.us-east-2.amazonaws.com/fvdb-reality-capture/crawler_480p.mp4" type="video/mp4" />
+  </video>
+
+|
+
+About ƒVDB
+--------------
+
+ƒVDB was first developed by the `NVIDIA High-Fidelity Physics Research Group <https://research.nvidia.com/labs/prl/>`_
+within the `NVIDIA Spatial Intelligence Lab <https://research.nvidia.com/labs/sil/>`_, and continues to be
+developed with the OpenVDB community to suit the growing needs for a robust framework for
+spatial intelligence research and applications.
+
+
+ƒVDB Reality Capture
+--------------------------------
+
+In addition to the core ƒVDB library, we also provide the `ƒVDB Reality Capture <https://fvdb-reality-capture.readthedocs.io/>`_ toolbox,
+which is a collection of tools and utilities for 3D reconstruction and scene understanding using ƒVDB. Analogous to how `torchvision <https://pytorch.org/vision/stable/index.html>`_
+provides datasets, models, and transforms for computer vision tasks, `ƒVDB Reality Capture <https://fvdb-reality-capture.readthedocs.io/>`_ provides datasets, models, and
+algorithms for 3D reconstruction from sensor data, including the high-level Gaussian splatting Python API.
+
+.. toctree::
+   :caption: Introduction
+   :hidden:
+
+   self
+   installation
+   release_notes
+   GitHub Repository <https://github.com/openvdb/fvdb-core>
+
+.. toctree::
+   :caption: Applications
+
+   ƒVDB Reality Capture <https://fvdb-reality-capture.readthedocs.io/>
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Tutorials
+
+   tutorials/basic_concepts
+   tutorials/jagged_tensor
+   tutorials/building_grids
+   tutorials/basic_grid_ops
+   tutorials/basic_convolution
+   tutorials/simple_unet
+   tutorials/io
+   tutorials/ray_tracing
+   tutorials/volume_rendering
+   tutorials/single_grid
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Documentation
+
+   api/jagged_tensor
+   api/operations
+   api/convolution_plan
+   api/sparse_grids
+   api/functional
+   api/viz
+   api/enums
+   api/nn
+   api/utils
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Development Process
+
+   release-process
+   markdown/clangd
+
+.. raw:: html
+
+   <hr>
+
+Indices and tables
+==================
+
+* :ref:`genindex`
+* :ref:`modindex`
+* :ref:`search`

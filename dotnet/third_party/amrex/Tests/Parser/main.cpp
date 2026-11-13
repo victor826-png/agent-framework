@@ -1,0 +1,956 @@
+#include <AMReX.H>
+#include <AMReX_Parser.H>
+#include <AMReX_IParser.H>
+#include <AMReX_Math.H>
+#include <cmath>
+#include <map>
+#include <numbers>
+#include <thread>
+#include <type_traits>
+#include <vector>
+
+using namespace amrex;
+
+namespace {
+    int max_stack_size = 0;
+    int test_number = 0;
+}
+
+template <typename F>
+int test1 (std::string const& f,
+           std::map<std::string,double> const& constants,
+           Vector<std::string> const& variables,
+           F const& fb, Array<double,1> const& lo, Array<double,1> const& hi,
+           int N, double reltol, double abstol)
+{
+    amrex::Print() << test_number++ << ". Testing \"" << f << "\"   ";
+
+    Parser parser(f);
+    for (auto const& kv : constants) {
+        parser.setConstant(kv.first, kv.second);
+    }
+    parser.registerVariables(variables);
+    auto const exe = parser.compile<1>();
+    max_stack_size = std::max(max_stack_size, parser.maxStackSize());
+
+    GpuArray<double,1> dx{(hi[0]-lo[0]) / (N-1)};
+
+    int nfail = 0;
+    double max_relerror = 0.;
+    for (int i = 0; i < N; ++i) {
+        double x = lo[0] + i*dx[0];
+        double result = exe(x);
+        double benchmark = fb(x);
+        double abserror = std::abs(result-benchmark);
+        double relerror = abserror / (1.e-50 + std::max(std::abs(result),std::abs(benchmark)));
+        if (abserror > abstol && relerror > reltol) {
+            amrex::Print() << "\n    f(" << x << ") = " << result << ", "
+                           << benchmark;
+            max_relerror = std::max(max_relerror, relerror);
+            ++nfail;
+        }
+    }
+    if (nfail > 0) {
+        amrex::Print() << "\n    failed " << nfail << " times.  Max rel. error: "
+                       << max_relerror << "\n";
+        return 1;
+    } else {
+        amrex::Print() << "    pass\n";
+        return 0;
+    }
+}
+
+template <typename F>
+int test3 (std::string const& f,
+           std::map<std::string,double> const& constants,
+           Vector<std::string> const& variables,
+           F const& fb, Array<double,3> const& lo, Array<double,3> const& hi,
+           int N, double reltol, double abstol)
+{
+    amrex::Print() << test_number++ << ". Testing \"" << f << "\"   ";
+
+    Parser parser(f);
+    for (auto const& kv : constants) {
+        parser.setConstant(kv.first, kv.second);
+    }
+    parser.registerVariables(variables);
+    auto const exe = parser.compile<3>();
+    max_stack_size = std::max(max_stack_size, parser.maxStackSize());
+
+    GpuArray<double,3> dx{(hi[0]-lo[0]) / (N-1),
+                          (hi[1]-lo[1]) / (N-1),
+                          (hi[2]-lo[2]) / (N-1)};
+    int nfail = 0;
+    for (int i = 0; i < N; ++i) {
+    for (int j = 0; j < N; ++j) {
+    for (int k = 0; k < N; ++k) {
+        double x = lo[0] + i*dx[0];
+        double y = lo[1] + j*dx[1];
+        double z = lo[2] + k*dx[2];
+        double result = exe(x,y,z);
+        double benchmark = fb(x,y,z);
+        double abserror = std::abs(result-benchmark);
+        double relerror = abserror / (1.e-50 + std::max(std::abs(result),std::abs(benchmark)));
+        if (abserror > abstol && relerror > reltol) {
+            amrex::Print() << "    f(" << x << "," << y << "," << z << ") = " << result << ", "
+                           << benchmark << "\n";
+            ++nfail;
+        }
+    }}}
+    if (nfail > 0) {
+        amrex::Print() << "    failed " << nfail << " times\n";
+        return 1;
+    } else {
+        amrex::Print() << "    pass\n";
+        return 0;
+    }
+}
+
+template <typename F>
+int test4 (std::string const& f,
+           std::map<std::string,double> const& constants,
+           Vector<std::string> const& variables,
+           F const& fb, Array<double,4> const& lo, Array<double,4> const& hi,
+           int N, double reltol, double abstol)
+{
+    amrex::Print() << test_number++ << ". Testing \"" << f << "\"   ";
+
+    Parser parser(f);
+    for (auto const& kv : constants) {
+        parser.setConstant(kv.first, kv.second);
+    }
+    parser.registerVariables(variables);
+    auto const exe = parser.compile<4>();
+    max_stack_size = std::max(max_stack_size, parser.maxStackSize());
+
+    GpuArray<double,4> dx{(hi[0]-lo[0]) / (N-1),
+                          (hi[1]-lo[1]) / (N-1),
+                          (hi[2]-lo[2]) / (N-1),
+                          (hi[3]-lo[3]) / (N-1)};
+    int nfail = 0;
+    for (int i = 0; i < N; ++i) {
+    for (int j = 0; j < N; ++j) {
+    for (int k = 0; k < N; ++k) {
+    for (int m = 0; m < N; ++m) {
+        double x = lo[0] + i*dx[0];
+        double y = lo[1] + j*dx[1];
+        double z = lo[2] + k*dx[2];
+        double t = lo[3] + m*dx[3];
+        double result = exe(x,y,z,t);
+        double benchmark = fb(x,y,z,t);
+        double abserror = std::abs(result-benchmark);
+        double relerror = abserror / (1.e-50 + std::max(std::abs(result),std::abs(benchmark)));
+        if (abserror > abstol && relerror > reltol) {
+            amrex::Print() << "    f(" << x << "," << y << "," << z << "," << t << ") = " << result << ", "
+                           << benchmark << "\n";
+            ++nfail;
+        }
+    }}}}
+    if (nfail > 0) {
+        amrex::Print() << "    failed " << nfail << " times\n";
+        return 1;
+    } else {
+        amrex::Print() << "    pass\n";
+        return 0;
+    }
+}
+
+int test_concurrent_parser_construction ()
+{
+    amrex::Print() << test_number++ << ". Testing concurrent Parser/IParser construction   ";
+
+    constexpr int nthreads = 2;
+    constexpr int niters = 64;
+    std::vector<int> nfail(nthreads, 0);
+    std::vector<std::thread> threads;
+    threads.reserve(nthreads);
+
+    for (int tid = 0; tid < nthreads; ++tid) {
+        threads.emplace_back([tid, &nfail] ()
+        {
+            int local_nfail = 0;
+            for (int iter = 0; iter < niters; ++iter) {
+                try {
+                    {
+                        Parser parser("a*x + b");
+                        auto const a = static_cast<double>(tid+1);
+                        auto const b = 0.25*static_cast<double>(iter+1);
+                        auto const x = static_cast<double>((iter % 7) - 3);
+                        parser.setConstant("a", a);
+                        parser.setConstant("b", b);
+                        parser.registerVariables({"x"});
+                        auto const exe = parser.compileHost<1>();
+                        if (std::abs(exe(x) - (a*x + b)) > 1.e-12) {
+                            ++local_nfail;
+                        }
+                    }
+                    {
+                        Parser parser("if(x > threshold, x*x + c, c-x)");
+                        auto const threshold = static_cast<double>((tid % 3) - 1);
+                        auto const c = 0.125*static_cast<double>(iter+1);
+                        auto const x = static_cast<double>((iter % 5) - 2);
+                        parser.setConstant("threshold", threshold);
+                        parser.setConstant("c", c);
+                        parser.registerVariables({"x"});
+                        auto const exe = parser.compileHost<1>();
+                        auto const expected = (x > threshold) ? x*x + c : c - x;
+                        if (std::abs(exe(x) - expected) > 1.e-12) {
+                            ++local_nfail;
+                        }
+                    }
+                    {
+                        IParser iparser("a*x + b");
+                        auto const a = static_cast<long long>(tid) + 1;
+                        auto const b = static_cast<long long>(iter) + 3;
+                        auto const x = static_cast<long long>((iter % 9) - 4);
+                        iparser.setConstant("a", a);
+                        iparser.setConstant("b", b);
+                        iparser.registerVariables({"x"});
+                        auto const exe = iparser.compileHost<1>();
+                        if (exe(x) != a*x + b) {
+                            ++local_nfail;
+                        }
+                    }
+                } catch (...) {
+                    ++local_nfail;
+                }
+            }
+            nfail[tid] = local_nfail;
+        });
+    }
+
+    int total_nfail = 0;
+    for (auto& thread : threads) {
+        thread.join();
+    }
+    for (auto n : nfail) {
+        total_nfail += n;
+    }
+
+    if (total_nfail > 0) {
+        amrex::Print() << "    failed " << total_nfail << " times\n";
+        return 1;
+    } else {
+        amrex::Print() << "    pass\n";
+        return 0;
+    }
+}
+
+template <typename T>
+int test_elliptic_integral_endpoints ()
+{
+    int nfail = 0;
+    T const tol = 64 * std::numeric_limits<T>::epsilon();
+    auto close = [tol] (T value, T expected) {
+        return amrex::Math::isfinite(value) &&
+            std::abs(value - expected) <= tol * std::abs(expected);
+    };
+    for (T k : {T(-1), T(1)}) {
+        T const first = amrex::Math::comp_ellint_1(k);
+        nfail += !(amrex::Math::isinf(first) && first > T(0));
+        nfail += amrex::Math::comp_ellint_2(k) != T(1);
+        T const inside = std::nextafter(k, T(0));
+        nfail += !amrex::Math::isfinite(amrex::Math::comp_ellint_1(inside));
+        nfail += !close(amrex::Math::comp_ellint_2(inside), T(1));
+    }
+    // Values away from the singular endpoint must remain unchanged.
+    nfail += !close(amrex::Math::comp_ellint_1(T(0)), amrex::Math::pi<T>() / 2);
+    nfail += !close(amrex::Math::comp_ellint_2(T(0)), amrex::Math::pi<T>() / 2);
+    nfail += !close(amrex::Math::comp_ellint_1(T(0.5)), T(1.6857503548125961));
+    nfail += !close(amrex::Math::comp_ellint_2(T(0.5)), T(1.4674622093394272));
+    // 100-digit references at exactly representable points near the endpoints.
+    T near_one;
+    T expected;
+    if constexpr (std::is_same_v<T,float>) {
+        near_one = T(1) - std::ldexp(T(1), -13);
+        expected = T(5.5454854002371954278);
+    } else {
+        near_one = T(1) - std::ldexp(T(1), -27);
+        expected = T(10.397207745269151667);
+    }
+    for (T k : {-near_one, near_one}) {
+        T const value = amrex::Math::comp_ellint_1(k);
+        nfail += !(amrex::Math::isfinite(value) &&
+            std::abs(value - expected) <= T(4) * std::numeric_limits<T>::epsilon() * expected);
+    }
+    amrex::Print() << "Elliptic-integral endpoints (" << sizeof(T)
+                   << " bytes): " << nfail << " failures\n";
+    return nfail;
+}
+
+int test_parser_elliptic_integral_endpoints ()
+{
+    int nfail = 0;
+    Parser parser("comp_ellint_2(k)");
+    parser.registerVariables({"k"});
+    auto const exe = parser.compile<1>();
+    for (double k : {-1., 1.}) {
+        nfail += exe(k) != 1.;
+    }
+    for (auto const* expression : {"comp_ellint_2(-1)", "comp_ellint_2(1)"}) {
+        Parser constant_parser(expression);
+        nfail += constant_parser.compile<0>()() != 1.;
+    }
+    amrex::Print() << "Parser elliptic-integral endpoints: " << nfail << " failures\n";
+    return nfail;
+}
+
+int main (int argc, char* argv[])
+{
+    amrex::Initialize(argc, argv);
+
+    {
+        amrex::Print() << "\n";
+        int nerror = 0;
+        nerror += test_elliptic_integral_endpoints<float>();
+        nerror += test_elliptic_integral_endpoints<double>();
+        nerror += test_parser_elliptic_integral_endpoints();
+        nerror += test3("if( ((z-zc)*(z-zc)+(y-yc)*(y-yc)+(x-xc)*(x-xc))^(0.5) < (r_star-dR), 0.0, if(((z-zc)*(z-zc)+(y-yc)*(y-yc)+(x-xc)*(x-xc))^(0.5) <= r_star, dens, 0.0))",
+                        {{"xc", 0.1}, {"yc", -1.0}, {"zc", 0.2}, {"r_star", 0.73}, {"dR", 0.57}, {"dens", 12.}},
+                        {"x","y","z"},
+                        [=] (double x, double y, double z) -> double {
+                            double xc=0.1, yc=-1.0, zc=0.2, r_star=0.73, dR=0.57, dens=12.;
+                            double r = std::sqrt((z-zc)*(z-zc) + (y-yc)*(y-yc) + (x-xc)*(x-xc));
+                            if (r >= r_star-dR && r <= r_star) {
+                                return dens;
+                            } else {
+                                return 0.0;
+                            }
+                        },
+                        {-1., -1., -1.0}, {1.0, 1.0, 1.0}, 100,
+                        1.e-12, 1.e-15);
+
+        nerror += test3("r=sqrt((z-zc)*(z-zc)+(y-yc)*(y-yc)+(x-xc)*(x-xc)); if(r < (r_star-dR), 0.0, if(r <= r_star, dens, 0.0))",
+                        {{"xc", 0.1}, {"yc", -1.0}, {"zc", 0.2}, {"r_star", 0.73}, {"dR", 0.57}, {"dens", 12.}},
+                        {"x","y","z"},
+                        [=] (double x, double y, double z) -> double {
+                            double xc=0.1, yc=-1.0, zc=0.2, r_star=0.73, dR=0.57, dens=12.;
+                            double r = std::sqrt((z-zc)*(z-zc) + (y-yc)*(y-yc) + (x-xc)*(x-xc));
+                            if (r >= r_star-dR && r <= r_star) {
+                                return dens;
+                            } else {
+                                return 0.0;
+                            }
+                        },
+                        {-1., -1., -1.0}, {1.0, 1.0, 1.0}, 100,
+                        1.e-12, 1.e-15);
+
+        nerror += test3("r=(z-zc)*(z-zc)+(y-yc)*(y-yc)+(x-xc)*(x-xc); r=sqrt(r); if(r < (r_star-dR), 0.0, if(r <= r_star, dens, 0.0))",
+                        {{"xc", 0.1}, {"yc", -1.0}, {"zc", 0.2}, {"r_star", 0.73}, {"dR", 0.57}, {"dens", 12.}},
+                        {"x","y","z"},
+                        [=] (double x, double y, double z) -> double {
+                            double xc=0.1, yc=-1.0, zc=0.2, r_star=0.73, dR=0.57, dens=12.;
+                            double r = std::sqrt((z-zc)*(z-zc) + (y-yc)*(y-yc) + (x-xc)*(x-xc));
+                            if (r >= r_star-dR && r <= r_star) {
+                                return dens;
+                            } else {
+                                return 0.0;
+                            }
+                        },
+                        {-1., -1., -1.0}, {1.0, 1.0, 1.0}, 100,
+                        1.e-12, 1.e-15);
+
+        // Local variables read right after assignment, including by fused
+        // instructions, and a local assigned from an if().
+        nerror += test3("r=x*x+y*y+z*z; r=sqrt(r); r",
+                        {}, {"x","y","z"},
+                        [=] (double x, double y, double z) -> double {
+                            double r = x*x+y*y+z*z; r = std::sqrt(r); return r;
+                        },
+                        {-1., -1., -1.0}, {1.0, 1.0, 1.0}, 20,
+                        1.e-12, 1.e-15);
+
+        nerror += test3("r=x+y; r*r+sin(r)-r^3+z*r+(r<0.5)",
+                        {}, {"x","y","z"},
+                        [=] (double x, double y, double z) -> double {
+                            double r = x+y;
+                            return r*r+std::sin(r)-r*r*r+z*r+((r<0.5)?1.0:0.0);
+                        },
+                        {-1., -1., -1.0}, {1.0, 1.0, 1.0}, 20,
+                        1.e-12, 1.e-15);
+
+        nerror += test3("r=x*2; s=if(x>y, 3, 4); t=z*3; (r>=1)*(r+s+t*s)",
+                        {}, {"x","y","z"},
+                        [=] (double x, double y, double z) -> double {
+                            double r = x*2, s = (x>y) ? 3.0 : 4.0, t = z*3;
+                            return ((r>=1) ? 1.0 : 0.0)*(r+s+t*s);
+                        },
+                        {-1., -1., -1.0}, {1.0, 1.0, 1.0}, 20,
+                        1.e-12, 1.e-15);
+
+        nerror += test3("x^3+sin(y)-sqrt(abs(z))+x^0.5+pow(y,z)+max(x,2)+atan2(3,y)",
+                        {}, {"x","y","z"},
+                        [=] (double x, double y, double z) -> double {
+                            return x*x*x+std::sin(y)-std::sqrt(std::abs(z))+std::sqrt(x)
+                                +std::pow(y,z)+std::max(x,2.0)+std::atan2(3.0,y);
+                        },
+                        {0.1, 0.1, -1.0}, {1.0, 1.0, 1.0}, 20,
+                        1.e-12, 1.e-15);
+
+        // Separate tests, since (x-sin(x))+(sin(x)-x) folds to 0.
+        nerror += test3("x-sin(x)",
+                        {}, {"x","y","z"},
+                        [=] (double x, double, double) -> double {
+                            return x-std::sin(x);
+                        },
+                        {-1., -1., -1.0}, {1.0, 1.0, 1.0}, 20,
+                        1.e-12, 1.e-15);
+
+        nerror += test3("sin(x)-x",
+                        {}, {"x","y","z"},
+                        [=] (double x, double, double) -> double {
+                            return std::sin(x)-x;
+                        },
+                        {-1., -1., -1.0}, {1.0, 1.0, 1.0}, 20,
+                        1.e-12, 1.e-15);
+
+        nerror += test3("( ((( (z-zc)*(z-zc) + (y-yc)*(y-yc) + (x-xc)*(x-xc) )^(0.5))<=r_star) * ((( (z-zc)*(z-zc) + (y-yc)*(y-yc) + (x-xc)*(x-xc) )^(0.5))>=(r_star-dR)) )*dens",
+                        {{"xc", 0.1}, {"yc", -1.0}, {"zc", 0.2}, {"r_star", 0.73}, {"dR", 0.57}, {"dens", 12.}},
+                        {"x","y","z"},
+                        [=] (double x, double y, double z) -> double {
+                            double xc=0.1, yc=-1.0, zc=0.2, r_star=0.73, dR=0.57, dens=12.;
+                            double r = std::sqrt((z-zc)*(z-zc) + (y-yc)*(y-yc) + (x-xc)*(x-xc));
+                            if (r >= r_star-dR && r <= r_star) {
+                                return dens;
+                            } else {
+                                return 0.0;
+                            }
+                        },
+                        {-1., -1., -1.0}, {1.0, 1.0, 1.0}, 100,
+                        1.e-12, 1.e-15);
+
+        nerror += test4("( (( (z-zc)*(z-zc) + (y-yc)*(y-yc) + (x-xc)*(x-xc) )^(0.5))>=r_star)*(-( (t<to)*(t/to)*omega + (t>=to)*omega )*(((x-xc)*(x-xc) + (y-yc)*(y-yc))^(0.5))/((1.0-( ( (t<to)*(t/to)*omega + (t>=to)*omega)  *(((x-xc)*(x-xc) + (y-yc)*(y-yc))^(0.5))/c)^2)^(0.5)) * (y-yc)/(((x-xc)*(x-xc) + (y-yc)*(y-yc))^(0.5)))",
+                        {{"xc", 0.1}, {"yc", -1.0}, {"zc", 0.2}, {"to", 3.}, {"omega", 0.33}, {"c", 30.}, {"r_star", 0.75}},
+                        {"x","y","z","t"},
+                        [=] (double x, double y, double z, double t) -> double {
+                            double xc=0.1, yc=-1.0, zc=0.2, to=3., omega=0.33, c=30., r_star=0.75;
+                            double r = std::sqrt((z-zc)*(z-zc) + (y-yc)*(y-yc) + (x-xc)*(x-xc));
+                            if (r >= r_star) {
+                                double tomega = (t>=to) ? omega : omega*(t/to);
+                                double r2d = std::sqrt((x-xc)*(x-xc) + (y-yc)*(y-yc));
+                                return -tomega * r / std::sqrt(1.0-(tomega*r2d/c)*(tomega*r2d/c)) * (y-yc)/r;
+                            } else {
+                                return 0.0;
+                            }
+                        },
+                        {-1., -1., -1.0, 0.0}, {1.0, 1.0, 1.0, 10}, 30,
+                        1.e-12, 1.e-15);
+
+        nerror += test4("r=sqrt((z-zc)*(z-zc) + (y-yc)*(y-yc) + (x-xc)*(x-xc)); tomega=if(t>=to, omega, omega*(t/to)); r2d=sqrt((y-yc)*(y-yc) + (x-xc)*(x-xc)); (r>=r_star)*(-tomega*r/(1.0-((tomega*r2d/c)^2))^0.5 * (y-yc)/r)",
+                        {{"xc", 0.1}, {"yc", -1.0}, {"zc", 0.2}, {"to", 3.}, {"omega", 0.33}, {"c", 30.}, {"r_star", 0.75}},
+                        {"x","y","z","t"},
+                        [=] (double x, double y, double z, double t) -> double {
+                            double xc=0.1, yc=-1.0, zc=0.2, to=3., omega=0.33, c=30., r_star=0.75;
+                            double r = std::sqrt((z-zc)*(z-zc) + (y-yc)*(y-yc) + (x-xc)*(x-xc));
+                            if (r >= r_star) {
+                                double tomega = (t>=to) ? omega : omega*(t/to);
+                                double r2d = std::sqrt((x-xc)*(x-xc) + (y-yc)*(y-yc));
+                                return -tomega * r / std::sqrt(1.0-(tomega*r2d/c)*(tomega*r2d/c)) * (y-yc)/r;
+                            } else {
+                                return 0.0;
+                            }
+                        },
+                        {-1., -1., -1.0, 0.0}, {1.0, 1.0, 1.0, 10}, 30,
+                        1.e-12, 1.e-15);
+
+        nerror += test3("cos(m * pi / Lx * (x - Lx / 2)) * cos(n * pi / Ly * (y - Ly / 2)) * sin(p * pi / Lz * (z - Lz / 2))*mu_0*(x>-0.5)*(x<0.5)*(y>-0.5)*(y<0.5)*(z>-0.5)*(z<0.5)",
+                        {{"m", 0.0}, {"n", 1.0}, {"pi", 3.14}, {"p", 1.0}, {"Lx", 1.}, {"Ly", 1.}, {"Lz", 1.}, {"mu_0", 1.27e-6}},
+                        {"x","y","z"},
+                        [=] (double x, double y, double z) -> double {
+                            double m=0.0,n=1.0,pi=3.14,p=1.0,Lx=1.,Ly=1.,Lz=1.,mu_0=1.27e-6;
+                            if ((x>-0.5) && (x<0.5) && (y>-0.5) && (y<0.5) && (z>-0.5) &&(z<0.5)) {
+                                return std::cos(m * pi / Lx * (x - Lx / 2)) * std::cos(n * pi / Ly * (y - Ly / 2)) * std::sin(p * pi / Lz * (z - Lz / 2))*mu_0;
+                            } else {
+                                return 0.0;
+                            }
+                        },
+                        {-0.8, -0.8, -0.8}, {0.8, 0.8, 0.8}, 100,
+                        1.e-12, 1.e-15);
+
+        nerror += test3("if ((x>-0.5) and (x<0.5) and (y>-0.5) and (y<0.5) and (z>-0.5) and (z<0.5), cos(m * pi / Lx * (x - Lx / 2)) * cos(n * pi / Ly * (y - Ly / 2)) * sin(p * pi / Lz * (z - Lz / 2))*mu_0*(x>-0.5)*(x<0.5)*(y>-0.5)*(y<0.5)*(z>-0.5)*(z<0.5), 0)",
+                        {{"m", 0.0}, {"n", 1.0}, {"pi", 3.14}, {"p", 1.0}, {"Lx", 1.}, {"Ly", 1.}, {"Lz", 1.}, {"mu_0", 1.27e-6}},
+                        {"x","y","z"},
+                        [=] (double x, double y, double z) -> double {
+                            double m=0.0,n=1.0,pi=3.14,p=1.0,Lx=1.,Ly=1.,Lz=1.,mu_0=1.27e-6;
+                            if ((x>-0.5) && (x<0.5) && (y>-0.5) && (y<0.5) && (z>-0.5) &&(z<0.5)) {
+                                return std::cos(m * pi / Lx * (x - Lx / 2)) * std::cos(n * pi / Ly * (y - Ly / 2)) * std::sin(p * pi / Lz * (z - Lz / 2))*mu_0;
+                            } else {
+                                return 0.0;
+                            }
+                        },
+                        {-0.8, -0.8, -0.8}, {0.8, 0.8, 0.8}, 100,
+                        1.e-12, 1.e-15);
+
+        nerror += test3("if ((-0.5 < x < 0.5) and (-0.5< (x+y) <0.5) and (-0.5<z<0.5), cos(m * pi / Lx * (x - Lx / 2)) * cos(n * pi / Ly * (y - Ly / 2)) * sin(p * pi / Lz * (z - Lz / 2))*mu_0, 0)",
+                        {{"m", 0.0}, {"n", 1.0}, {"pi", 3.14}, {"p", 1.0}, {"Lx", 1.}, {"Ly", 1.}, {"Lz", 1.}, {"mu_0", 1.27e-6}},
+                        {"x","y","z"},
+                        [=] (double x, double y, double z) -> double {
+                            double m=0.0,n=1.0,pi=3.14,p=1.0,Lx=1.,Ly=1.,Lz=1.,mu_0=1.27e-6;
+                            if ((x>-0.5) && (x<0.5) && ((x+y)>-0.5) && ((x+y)<0.5) && (z>-0.5) &&(z<0.5)) {
+                                return std::cos(m * pi / Lx * (x - Lx / 2)) * std::cos(n * pi / Ly * (y - Ly / 2)) * std::sin(p * pi / Lz * (z - Lz / 2))*mu_0;
+                            } else {
+                                return 0.0;
+                            }
+                        },
+                        {-0.8, -0.8, -0.8}, {0.8, 0.8, 0.8}, 100,
+                        1.e-12, 1.e-15);
+
+        nerror += test3("cos(m * pi / Lx * (x - Lx / 2)) * cos(n * pi / Ly * (y - Ly / 2)) * sin(p * pi / Lz * (z - Lz / 2))*mu_0*(0.5>x>y>z>(x+z)>-0.5)",
+                        {{"m", 0.0}, {"n", 1.0}, {"pi", 3.14}, {"p", 1.0}, {"Lx", 1.}, {"Ly", 1.}, {"Lz", 1.}, {"mu_0", 1.27e-6}},
+                        {"x","y","z"},
+                        [=] (double x, double y, double z) -> double {
+                            double m=0.0,n=1.0,pi=3.14,p=1.0,Lx=1.,Ly=1.,Lz=1.,mu_0=1.27e-6;
+                            if ((0.5>x) && (x>y) && (y>z) && (z>(x+z)) && ((x+z)>-0.5)) {
+                                return std::cos(m * pi / Lx * (x - Lx / 2)) * std::cos(n * pi / Ly * (y - Ly / 2)) * std::sin(p * pi / Lz * (z - Lz / 2))*mu_0;
+                            } else {
+                                return 0.0;
+                            }
+                        },
+                        {-0.8, -0.8, -0.8}, {0.8, 0.8, 0.8}, 100,
+                        1.e-12, 1.e-15);
+
+        nerror += test3("2.*sqrt(2.)+sqrt(-log(x))*cos(2*pi*z)",
+                        {{"pi", 3.14}},
+                        {"x","y","z"},
+                        [=] (double x, double, double z) -> double {
+                            double pi = 3.14;
+                            return 2.*std::numbers::sqrt2+std::sqrt(-std::log(x))*std::cos(2*pi*z);
+                        },
+                        {0.5, 0.8, 0.3}, {16, 16, 16}, 100,
+                        1.e-12, 1.e-15);
+
+        nerror += test1("nc*n0*(if(abs(z)<=r0, 1.0, if(abs(z)<r0+Lcut, exp((-abs(z)+r0)/L), 0.0)))",
+                        {{"nc",1.742e27},{"n0",30.},{"r0",2.5e-6},{"Lcut",2.e-6},{"L",0.05e-6}},
+                        {"z"},
+                        [=] (double z) -> double {
+                            double nc=1.742e27, n0=30., r0=2.5e-6, Lcut=2.e-6, L=0.05e-6;
+                            if (std::abs(z) <= r0) {
+                                return nc*n0;
+                            } else if (std::abs(z) < r0+Lcut) {
+                                return nc*n0*std::exp((-std::abs(z)+r0)/L);
+                            } else {
+                                return 0.0;
+                            }
+                        },
+                        {-5.e-6}, {25.e-6}, 10000,
+                        1.e-12, 1.e-15);
+
+        nerror += test1("(z<lramp)*0.5*(1-cos(pi*z/lramp))*dens+(z>lramp)*dens",
+                        {{"lramp",8.e-3},{"pi",3.14},{"dens",1.e23}},
+                        {"z"},
+                        [=] (double z) -> double {
+                            double lramp=8.e-3, pi=3.14, dens=1.e23;
+                            if (z < lramp) {
+                                return 0.5*(1-std::cos(pi*z/lramp))*dens;
+                            } else {
+                                return dens;
+                            }
+                        },
+                        {-149.e-6}, {1.e-6}, 1000,
+                        1.e-12, 1.e-15);
+
+        nerror += test1("if(z<lramp, sin(pi/2*z/lramp)**2*dens, dens)",
+                        {{"lramp",8.e-3},{"pi",3.14},{"dens",1.e23}},
+                        {"z"},
+                        [=] (double z) -> double {
+                            double lramp=8.e-3, pi=3.14, dens=1.e23;
+                            if (z < lramp) {
+                                auto x = std::sin(pi/2*z/lramp);
+                                return x*x*dens;
+                            } else {
+                                return dens;
+                            }
+                        },
+                        {-149.e-6}, {1.e-6}, 1000,
+                        1.e-12, 1.e-15);
+
+        nerror += test1("if(z<zp, nc*exp((z-zc)/lgrad), if(z<=zp2, 2.*nc, nc*exp(-(z-zc2)/lgrad)))",
+                        {{"zc",20.e-6},{"zp",20.05545177444479562e-6},{"nc",1.74e27},{"lgrad",0.08e-6},{"zp2",24.e-6},{"zc2",24.05545177444479562e6}},
+                        {"z"},
+                        [=] (double z) -> double {
+                            double zc=20.e-6, zp=20.05545177444479562e-6, nc=1.74e27, lgrad=0.08e-6, zp2=24.e-6, zc2=24.05545177444479562e6;
+                            if (z < zp) {
+                                return nc*std::exp((z-zc)/lgrad);
+                            } else if (z <= zp2) {
+                                return 2.*nc;
+                            } else {
+                                return nc*exp(-(z-zc2)/lgrad);
+                            }
+                        },
+                        {0.}, {100.e-6}, 1000,
+                        1.e-12, 1.e-15);
+
+        nerror += test3("epsilon/kp*2*x/w0**2*exp(-(x**2+y**2)/w0**2)*sin(k0*z)",
+                        {{"epsilon",0.01},{"kp",3.5},{"w0",5.e-6},{"k0",3.e5}},
+                        {"x","y","z"},
+                        [=] (double x, double y, double z) -> double {
+                            double epsilon=0.01, kp=3.5, w0=5.e-6, k0=3.e5;
+                            return epsilon/kp*2*x/(w0*w0)*std::exp(-(x*x+y*y)/(w0*w0))*sin(k0*z);
+                        },
+                        {0.e-6, 0.0, -20.e-6}, {20.e-6, 1.e-10, 20.e-6}, 100,
+                        1.e-12, 1.e-15);
+        nerror += test_concurrent_parser_construction();
+
+#if !(defined(AMREX_USE_SYCL) && !(defined(__INTEL_LLVM_COMPILER) || defined(__INTEL_CLANG_COMPILER)))
+        for (int n : {-5, -2, -1, 0, 1, 2, 5}) {
+            nerror += test1("jn(" + std::to_string(n) + ",x)", {}, {"x"},
+                            [=] (double x) -> double {
+#if defined(_WIN32) && defined(__MINGW32__)
+                                int const m = n < 0 ? -n : n;
+                                double const xa = x < 0.0 ? -x : x;
+                                double r = std::cyl_bessel_j(double(m), xa);
+                                if ((m % 2 != 0) && ((n < 0) != (x < 0.0))) {
+                                    r = -r;
+                                }
+                                return r;
+#elif defined(_WIN32)
+                                return ::_jn(n, x);
+#else
+                                return ::jn(n, x);
+#endif
+                            },
+                            {-5.0}, {5.0}, 100, 1.e-12, 1.e-14);
+
+            nerror += test1("yn(" + std::to_string(n) + ",x)", {}, {"x"},
+                            [=] (double x) -> double {
+#if defined(_WIN32) && defined(__MINGW32__)
+                                int const m = n < 0 ? -n : n;
+                                double r = std::cyl_neumann(double(m), x);
+                                if ((m % 2 != 0) && (n < 0)) {
+                                    r = -r;
+                                }
+                                return r;
+#elif defined(_WIN32)
+                                return ::_yn(n, x);
+#else
+                                return ::yn(n, x);
+#endif
+                            },
+                            {0.5}, {5.0}, 100, 1.e-12, 1.e-14);
+        }
+#endif
+
+        // Edge cases where the optimizer must agree with the runtime evaluator.
+
+        // pow(pow(x,m),n) may only be merged for integer m and n.
+        nerror += test1("(x**2)**0.5", {}, {"x"},
+                        [=] (double x) -> double { return std::pow(std::pow(x,2.0),0.5); },
+                        {-3.0}, {3.0}, 101, 1.e-12, 1.e-15);
+        nerror += test1("(x**2)**1.5", {}, {"x"},
+                        [=] (double x) -> double { return std::pow(std::pow(x,2.0),1.5); },
+                        {-3.0}, {3.0}, 101, 1.e-12, 1.e-15);
+        nerror += test1("((x-1)*(x-1))**0.5", {}, {"x"},
+                        [=] (double x) -> double { return std::pow((x-1.0)*(x-1.0),0.5); },
+                        {-3.0}, {3.0}, 101, 1.e-12, 1.e-15);
+        // Integer exponents still merge.
+        nerror += test1("(x**2)**3", {}, {"x"},
+                        [=] (double x) -> double { return std::pow(std::pow(x,2.0),3.0); },
+                        {-3.0}, {3.0}, 101, 1.e-12, 1.e-15);
+
+        // Integer exponents too large for int must not take the powi path.
+        nerror += test1("x**3e9", {}, {"x"},
+                        [=] (double x) -> double { return std::pow(x,3.e9); },
+                        {0.5}, {0.9}, 5, 1.e-12, 1.e-15);
+        nerror += test1("x**-2147483648", {}, {"x"},
+                        [=] (double x) -> double { return std::pow(x,-2147483648.); },
+                        {1.1}, {2.0}, 5, 1.e-12, 1.e-15);
+        nerror += test1("x**-2147483647", {}, {"x"},
+                        [=] (double x) -> double { return std::pow(x,-2147483647.); },
+                        {1.1}, {2.0}, 5, 1.e-12, 1.e-15);
+
+        // A // comment must end at its own line.
+        nerror += test1("x + 1 // add one\n + 2*x // add 2x\r\n - 3", {}, {"x"},
+                        [=] (double x) -> double { return 3.0*x - 2.0; },
+                        {-1.0}, {1.0}, 5, 1.e-12, 1.e-15);
+
+        // pow with a constant zero base: std::pow(0,0) is 1 and pow(0,-1) is inf.
+        nerror += test1("c**x", {{"c",0.0}}, {"x"},
+                        [=] (double x) -> double { return std::pow(0.0,x); },
+                        {0.0}, {4.0}, 5, 1.e-12, 1.e-15);
+        nerror += test1("0**x", {}, {"x"},
+                        [=] (double x) -> double { return std::pow(0.0,x); },
+                        {0.0}, {4.0}, 5, 1.e-12, 1.e-15);
+
+        // and/or must return 1 or 0, not the operand.
+        nerror += test1("x and 1", {}, {"x"},
+                        [=] (double x) -> double { return (x != 0.0) ? 1.0 : 0.0; },
+                        {-2.0}, {2.0}, 5, 1.e-12, 1.e-15);
+        nerror += test1("1 and x", {}, {"x"},
+                        [=] (double x) -> double { return (x != 0.0) ? 1.0 : 0.0; },
+                        {-2.0}, {2.0}, 5, 1.e-12, 1.e-15);
+        nerror += test1("(x and 1)+1", {}, {"x"},
+                        [=] (double x) -> double { return ((x != 0.0) ? 1.0 : 0.0) + 1.0; },
+                        {-2.0}, {2.0}, 5, 1.e-12, 1.e-15);
+        nerror += test1("x or 0", {}, {"x"},
+                        [=] (double x) -> double { return (x != 0.0) ? 1.0 : 0.0; },
+                        {-2.0}, {2.0}, 5, 1.e-12, 1.e-15);
+        nerror += test1("0 or x", {}, {"x"},
+                        [=] (double x) -> double { return (x != 0.0) ? 1.0 : 0.0; },
+                        {-2.0}, {2.0}, 5, 1.e-12, 1.e-15);
+        nerror += test1("x and c", {{"c",1.0}}, {"x"},
+                        [=] (double x) -> double { return (x != 0.0) ? 1.0 : 0.0; },
+                        {-2.0}, {2.0}, 5, 1.e-12, 1.e-15);
+        // An operand that is already 0 or 1 needs no extra operation.
+        nerror += test1("(x>0) and 1", {}, {"x"},
+                        [=] (double x) -> double { return (x > 0.0) ? 1.0 : 0.0; },
+                        {-2.0}, {2.0}, 5, 1.e-12, 1.e-15);
+
+        {   // Re-registering must forget the variables it drops, even when the
+            // syntax tree is shared with a copy of the Parser.
+            amrex::Print() << test_number++ << ". Testing Parser re-registration\n";
+            auto expect_unknown = [&] (Parser const& p) -> bool
+            {
+                try {
+                    Parser q = p; // NOLINT(performance-unnecessary-copy-initialization)
+                    auto exe = q.compile<1>();
+                    auto r = exe(2.0);
+                    amrex::ignore_unused(r);
+                    return false;
+                } catch (std::runtime_error const& e) {
+                    amrex::Print() << "    Expected error: " << e.what() << '\n';
+                    return true;
+                }
+            };
+            {
+                Parser p("x+y");
+                p.registerVariables({"x","y"});
+                p.registerVariables({"y"});
+                if (!expect_unknown(p)) { ++nerror; }
+            }
+            {   // The copy registers, so the original's stale binding must go.
+                Parser p("x+y");
+                Parser q = p;
+                p.registerVariables({"x","y"});
+                q.registerVariables({"y"});
+                if (!expect_unknown(q)) { ++nerror; }
+            }
+            {   // Reordering is still allowed.
+                Parser p("x-y");
+                p.registerVariables({"x","y"});
+                p.registerVariables({"y","x"});
+                auto exe = p.compile<2>();
+                if (exe(3.0,10.0) != 7.0) { ++nerror; } // y=3, x=10
+            }
+        }
+
+        {   // All statements but the last must be assignments.
+            amrex::Print() << test_number++ << ". Testing Parser statement lists\n";
+            for (std::string const s : {"b=x", "b=x;", "x; b=x", "x; 1"}) {
+                try {
+                    Parser p(s);
+                    ++nerror;
+                } catch (std::runtime_error const& e) {
+                    amrex::Print() << "    Expected error: " << e.what() << '\n';
+                }
+            }
+            Parser p("b=2*x; b+1;");
+            p.registerVariables({"x"});
+            auto exe = p.compileHost<1>();
+            if (exe(3.0) != 7.0) { ++nerror; }
+        }
+
+        amrex::Print() << "\nMax stack size is " << max_stack_size << "\n";
+        if (nerror > 0) {
+            amrex::Print() << nerror << " tests failed\n";
+            amrex::Abort();
+        } else {
+            amrex::Print() << "All tests passed\n";
+        }
+        amrex::Print() << "\n";
+    }
+
+    {
+        int count = 0;
+        int x = 11;
+        {
+            auto f = [&] (std::string const& s)
+            {
+                amrex::Print() << count++ << ". Testing \"" << s << "\"\n";
+                IParser iparser(s);
+                iparser.registerVariables({"x"});
+                auto exe = iparser.compileHost<1>();
+                return exe(x);
+            };
+            AMREX_ALWAYS_ASSERT(f("2*(x/3)") == (2*(x/3)));
+            AMREX_ALWAYS_ASSERT(f("2*(3/x)") == (2*(3/x)));
+            AMREX_ALWAYS_ASSERT(f("2/(x/3)") == (2/(x/3)));
+            AMREX_ALWAYS_ASSERT(f("2/(22/x)") == (2/(22/x)));
+            AMREX_ALWAYS_ASSERT(f("x/13*5") == ((x/13)*5));
+            AMREX_ALWAYS_ASSERT(f("13/x*5") == ((13/x)*5));
+            AMREX_ALWAYS_ASSERT(f("x/13/5") == ((x/13)/5));
+            AMREX_ALWAYS_ASSERT(f("13/x/5") == ((13/x)/5));
+
+            auto g = [&] (std::string const& s, std::string const& c, int cv)
+            {
+                amrex::Print() << count++ << ". Testing \"" << s << "\"\n";
+                IParser iparser(s);
+                iparser.registerVariables({"x"});
+                iparser.setConstant(c, cv);
+                auto exe = iparser.compileHost<1>();
+                return exe(x);
+            };
+            AMREX_ALWAYS_ASSERT(g("a*(x/3)", "a", 2) == (2*(x/3)));
+            AMREX_ALWAYS_ASSERT(g("a*(3/x)", "a", 2) == (2*(3/x)));
+            AMREX_ALWAYS_ASSERT(g("a/(x/3)", "a", 2) == (2/(x/3)));
+            AMREX_ALWAYS_ASSERT(g("a/(22/x)", "a", 2) == (2/(22/x)));
+            AMREX_ALWAYS_ASSERT(g("x/b*5", "b", 13) == ((x/13)*5));
+            AMREX_ALWAYS_ASSERT(g("b/x*5", "b", 13) == ((13/x)*5));
+            AMREX_ALWAYS_ASSERT(g("x/b/5", "b", 13) == ((x/13)/5));
+            AMREX_ALWAYS_ASSERT(g("b/x/5", "b", 13) == ((13/x)/5));
+
+            auto h = [&] (std::string const& s)
+            {
+                amrex::Print() << count++ << ". Testing \"" << s << "\"\n";
+                IParser iparser(s);
+                auto exe = iparser.compileHost<0>();
+                return exe();
+            };
+            AMREX_ALWAYS_ASSERT(h("2**10") == 1024);
+            AMREX_ALWAYS_ASSERT(h("3^-1") == 1/3);
+            AMREX_ALWAYS_ASSERT(h("5^0") == 1);
+            AMREX_ALWAYS_ASSERT(h("(-2)**3") == -8);
+            AMREX_ALWAYS_ASSERT(h("(-3)**-1") == 1/(-3));
+            AMREX_ALWAYS_ASSERT(h("(-5)^0") == 1);
+
+            amrex::Print() << count++ << ". Testing \"a // b\"\n";
+            for (int a = -15; a <= 15; ++a) {
+                for (int b = -5; b <= 5; ++b) {
+                    if (b != 0) {
+                        IParser iparser("a//b");
+                        iparser.setConstant("a",a);
+                        iparser.registerVariables({"b"});
+                        auto exe = iparser.compile<1>();
+                        AMREX_ALWAYS_ASSERT(exe(b) ==
+                                            static_cast<int>(std::floor(double(a)/double(b))));
+                    }
+                }
+            }
+
+            // A division that the executor never evaluates must not be folded.
+            AMREX_ALWAYS_ASSERT(h("if(0, 1/0, 2)") == 2);
+            AMREX_ALWAYS_ASSERT(h("if(0, 1//0, 2)") == 2);
+            AMREX_ALWAYS_ASSERT(g("if(n > 1, 100/(n-1), 0)", "n", 1) == 0);
+            AMREX_ALWAYS_ASSERT(g("if(n > 1, 100//(n-1), 0)", "n", 1) == 0);
+            AMREX_ALWAYS_ASSERT(g("if(n > 1, x/(n-1), 0)", "n", 1) == 0);
+            AMREX_ALWAYS_ASSERT(g("if(n > 1, 100/n, 0)", "n", 0) == 0);
+            AMREX_ALWAYS_ASSERT(g("if(n > 1, 100//n, 0)", "n", 0) == 0);
+            AMREX_ALWAYS_ASSERT(g("if(n > 1, 100/(n-1), 0)", "n", 3) == 50);
+            AMREX_ALWAYS_ASSERT(g("if(n > 1, 100/n, 0)", "n", 4) == 25);
+            AMREX_ALWAYS_ASSERT(g("if(n > 1, x/(n-1), 0)", "n", 3) == x/2);
+
+            {   // A local variable makes the compiler resolve symbol offsets, so
+                // a node left claiming the wrong operand types would be fatal.
+                amrex::Print() << count++ << ". Testing \"t=7; if(c, x/n, t)\"\n";
+                IParser iparser("t=7; if(c, x/n, t)");
+                iparser.setConstant("n", 0);
+                iparser.registerVariables({"x","c"});
+                auto exe = iparser.compileHost<2>();
+                AMREX_ALWAYS_ASSERT(exe(10,0) == 7);
+            }
+
+            AMREX_ALWAYS_ASSERT(h("123456789012345") == 123456789012345LL);
+            AMREX_ALWAYS_ASSERT(h("123456789012345.") == 123456789012345LL);
+            AMREX_ALWAYS_ASSERT(h("123'456'789'012'345") == 123456789012345LL);
+            AMREX_ALWAYS_ASSERT(h("1.23456789012345e14") == 123456789012345LL);
+            AMREX_ALWAYS_ASSERT(h("1.0E3") == 1000);
+            AMREX_ALWAYS_ASSERT(h("2**40") == 1024LL*1024LL*1024LL*1024LL);
+
+            auto test_bad_number = [&] (std::string const& s)
+            {
+                amrex::Print() << count++ << ". Testing \"" << s << "\"\n";
+                try {
+                    IParser iparser(s);
+                    auto exe = iparser.compileHost<0>();
+                    auto r = exe();
+                    amrex::ignore_unused(r);
+                    return false;
+                } catch (std::runtime_error const& e) {
+                    amrex::Print() << "    Expected error: " << e.what() << '\n';
+                    return true;
+                }
+            };
+            // An unregistered variable must be rejected, whatever optimized
+            // node form it ends up in.
+            auto test_unknown_var = [&] (std::string const& s)
+            {
+                amrex::Print() << count++ << ". Testing \"" << s << "\"\n";
+                try {
+                    IParser iparser(s);
+                    iparser.registerVariables({"x"});
+                    auto exe = iparser.compileHost<1>();
+                    auto r = exe(1);
+                    amrex::ignore_unused(r);
+                    return false;
+                } catch (std::runtime_error const& e) {
+                    amrex::Print() << "    Expected error: " << e.what() << '\n';
+                    return true;
+                }
+            };
+            AMREX_ALWAYS_ASSERT(test_unknown_var("y"));        // SYMBOL
+            AMREX_ALWAYS_ASSERT(test_unknown_var("y+2"));      // ADD_VP
+            AMREX_ALWAYS_ASSERT(test_unknown_var("2-y"));      // SUB_VP
+            AMREX_ALWAYS_ASSERT(test_unknown_var("2*y"));      // MUL_VP
+            AMREX_ALWAYS_ASSERT(test_unknown_var("2/y"));      // DIV_VP
+            AMREX_ALWAYS_ASSERT(test_unknown_var("y/2"));      // DIV_PV
+            AMREX_ALWAYS_ASSERT(test_unknown_var("0-y"));      // NEG_P
+            AMREX_ALWAYS_ASSERT(test_unknown_var("x+y"));      // ADD_PP
+            AMREX_ALWAYS_ASSERT(test_unknown_var("x-y"));      // SUB_PP
+            AMREX_ALWAYS_ASSERT(test_unknown_var("x*y"));      // MUL_PP
+            AMREX_ALWAYS_ASSERT(test_unknown_var("x/y"));      // DIV_PP
+            AMREX_ALWAYS_ASSERT(test_unknown_var("y+x"));
+            AMREX_ALWAYS_ASSERT(test_unknown_var("if(x>0, y, 0)"));
+            AMREX_ALWAYS_ASSERT(test_unknown_var("t=2*y; t+x"));
+
+            {   // Re-registering must forget the variables it drops.
+                amrex::Print() << count++ << ". Testing IParser re-registration\n";
+                IParser iparser("x+y");
+                iparser.registerVariables({"x","y"});
+                iparser.registerVariables({"y"});
+                bool caught = false;
+                try {
+                    auto exe = iparser.compileHost<1>();
+                    auto r = exe(1);
+                    amrex::ignore_unused(r);
+                } catch (std::runtime_error const& e) {
+                    amrex::Print() << "    Expected error: " << e.what() << '\n';
+                    caught = true;
+                }
+                AMREX_ALWAYS_ASSERT(caught);
+            }
+
+            {   // Reordering is still allowed.
+                amrex::Print() << count++ << ". Testing IParser reordering\n";
+                IParser iparser("x-y");
+                iparser.registerVariables({"x","y"});
+                iparser.registerVariables({"y","x"});
+                auto exe = iparser.compileHost<2>();
+                AMREX_ALWAYS_ASSERT(exe(3,10) == 7); // y=3, x=10
+            }
+
+            {   // All statements but the last must be assignments.
+                amrex::Print() << count++ << ". Testing IParser statement lists\n";
+                for (std::string const s : {"b=x", "b=x;", "x; b=x", "x; 1"}) {
+                    bool caught = false;
+                    try {
+                        IParser iparser(s);
+                    } catch (std::runtime_error const& e) {
+                        amrex::Print() << "    Expected error: " << e.what() << '\n';
+                        caught = true;
+                    }
+                    AMREX_ALWAYS_ASSERT(caught);
+                }
+                IParser iparser("b=2*x; b+1;");
+                iparser.registerVariables({"x"});
+                auto exe = iparser.compileHost<1>();
+                AMREX_ALWAYS_ASSERT(exe(3) == 7);
+            }
+
+            AMREX_ALWAYS_ASSERT(test_bad_number("1000000e-4"));
+            AMREX_ALWAYS_ASSERT(test_bad_number("1.234e2"));
+            AMREX_ALWAYS_ASSERT(test_bad_number("3.14"));
+        }
+        amrex::Print() << "\nAll IParser tests passed\n\n";
+    }
+
+    amrex::Finalize();
+}

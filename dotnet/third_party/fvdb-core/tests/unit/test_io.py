@@ -1,0 +1,663 @@
+# Copyright Contributors to the OpenVDB Project
+# SPDX-License-Identifier: Apache-2.0
+#
+import itertools
+import tempfile
+import unittest
+from pathlib import Path
+
+import numpy as np
+import torch
+from parameterized import parameterized
+
+import fvdb
+import fvdb.functional
+from fvdb.utils.tests import get_fvdb_test_data_path
+
+standard_dtypes_and_dims = [
+    (torch.float16, 1),
+    (torch.float16, ()),
+    (torch.float32, 1),
+    (torch.float32, 3),
+    (torch.float32, 4),
+    (torch.float32, ()),
+    (torch.float64, 1),
+    (torch.float64, 3),
+    (torch.float64, 4),
+    (torch.float64, ()),
+    (torch.int32, 1),
+    (torch.int32, ()),
+    (torch.int64, 1),
+    (torch.int64, ()),
+    (torch.uint8, 4),
+]
+
+other_dtypes_and_dims = [
+    (torch.uint8, 1),
+    (torch.uint8, ()),
+    (torch.uint8, (1, 4)),
+    (torch.float32, (4, 3, 2, 1, 1, 1)),
+    (torch.float16, (4, 4)),
+    (torch.int32, (4, 7, 1)),
+    (torch.int64, (1, 1, 1, 1, 1)),
+    (torch.float64, (1, 3, 1, 3, 1, 3, 1)),
+]
+
+all_dtypes_and_dims = standard_dtypes_and_dims + other_dtypes_and_dims
+
+all_names_compressed_devices_dtypes_and_dims = list(
+    itertools.product(
+        [1, 2, 4],  # Batch size
+        [True, False],  # Include names or not
+        [True, False],  # Compressed
+        ["cpu", "cuda"],  # Device
+        all_dtypes_and_dims,
+    )
+)
+
+_voxelsize_standard_type_params = list(
+    itertools.product(
+        ["cpu", "cuda"],
+        [
+            (torch.float16, 1),
+            (torch.float32, 1),
+            (torch.float32, 3),
+            (torch.float32, 4),
+            (torch.float64, 1),
+            (torch.float64, 3),
+            (torch.float64, 4),
+            (torch.int32, 1),
+            (torch.int64, 1),
+            (torch.uint8, 4),
+        ],
+    )
+)
+
+_voxelsize_nonstandard_shape_params = list(
+    itertools.product(
+        ["cpu", "cuda"],
+        [
+            (torch.float32, (5,)),
+            (torch.float32, (3, 3)),
+            (torch.float32, (4, 3, 2)),
+            (torch.int32, (4, 7)),
+            (torch.float64, (5,)),
+        ],
+    )
+)
+
+
+class TestIO(unittest.TestCase):
+    def setUp(self):
+        pass
+
+    @parameterized.expand(all_names_compressed_devices_dtypes_and_dims)
+    def test_save_and_load_gridbatch(self, batch_size, include_names, compressed, device, dtype_and_dim):
+        dtype, dim = dtype_and_dim
+        dim = [dim] if isinstance(dim, int) else list(dim)
+        torch.manual_seed(0)
+        np.random.seed(0)
+
+        name = ""
+        names = []
+        if include_names:
+            names = [f"grid-{i}" for i in range(batch_size)]
+            if batch_size == 1 and np.random.rand() > 0.5:
+                name = names[0]
+
+        sizes = [np.random.randint(100, 200) for _ in range(batch_size)]
+        grid_ijk = fvdb.JaggedTensor([torch.randint(-512, 512, (sizes[i], 3)) for i in range(batch_size)]).to(device)
+        grid = fvdb.GridBatch.from_ijk(grid_ijk)
+        sizes = [[int(grid.num_voxels[i].item())] + dim for i in range(batch_size)]
+        data = fvdb.JaggedTensor([(torch.rand(*sizes[i], device=device) * 256).to(dtype) for i in range(batch_size)])
+
+        with tempfile.NamedTemporaryFile() as temp:
+            if name:
+                grid.save_nanovdb(temp.name, data, name=name, compressed=compressed)
+            else:
+                grid.save_nanovdb(temp.name, data, names=names, compressed=compressed)
+            grid2, data2, names2 = fvdb.GridBatch.from_nanovdb(temp.name, device=device)
+
+            if name:
+                names = [name] * batch_size
+            elif not names:
+                names = [""] * batch_size
+
+            self.assertTrue(names == names2, f"{names}, {names2}")
+
+            # NOTE: (@fwilliams) For some reason, when we build on the GPU, things get reordered when we load.
+            # This is due to a bug in NanoVDB. We can't test for equality, but we can test for equivalence.
+            if device == "cuda":
+                for bi in range(batch_size):
+                    grid_ijk_i = grid.ijk[bi].jdata
+                    grid2_ijk_i = grid2.ijk[bi].jdata
+                    grid_data_i = data[bi].jdata.unsqueeze(-1) if data.jdata.ndim == 1 else data[bi].jdata
+                    grid2_data_i = data2[bi].jdata.unsqueeze(-1) if data2.jdata.ndim == 1 else data2[bi].jdata
+
+                    grid_ijk_i_list = [tuple(grid_ijk_i[i].cpu().numpy().tolist()) for i in range(grid_ijk_i.shape[0])]
+                    grid2_ijk_i_list = [
+                        tuple(grid2_ijk_i[i].cpu().numpy().tolist()) for i in range(grid2_data_i.shape[0])
+                    ]
+
+                    grid_data_i_list = [
+                        tuple(grid_data_i[i].view(-1).cpu().numpy().tolist()) for i in range(grid_data_i.shape[0])
+                    ]
+                    grid2_data_i_list = [
+                        tuple(grid_data_i[i].view(-1).cpu().numpy().tolist()) for i in range(grid2_data_i.shape[0])
+                    ]
+
+                    grid_i_dict = dict(zip(grid_ijk_i_list, grid_data_i_list))
+                    grid2_i_dict = dict(zip(grid2_ijk_i_list, grid2_data_i_list))
+
+                    self.assertTrue(set(grid_ijk_i_list) == set(grid2_ijk_i_list))
+                    self.assertTrue(set(grid_data_i_list) == set(grid2_data_i_list))
+
+                    # FIXME: (@fwilliams) -- This will fail because of a bug in NanoVDB
+                    # self.assertTrue(grid_i_dict == grid2_i_dict)
+            else:
+                self.assertTrue(torch.all(grid.ijk.jdata == grid2.ijk.jdata))
+                self.assertTrue(torch.all(data.jdata == data2.jdata))
+
+    @parameterized.expand(itertools.product(["cuda", "cpu"], [1, 3]))
+    def test_save_and_load_gridbatch_without_data(self, device, batch_size):
+        torch.manual_seed(0)
+        np.random.seed(0)
+
+        names = []
+
+        sizes = [np.random.randint(10, 20) for _ in range(batch_size)]
+        grid_ijk = fvdb.JaggedTensor([torch.randint(-512, 512, (sizes[i], 3)) for i in range(batch_size)]).to(device)
+        grid = fvdb.GridBatch.from_ijk(grid_ijk)
+
+        with tempfile.NamedTemporaryFile() as temp:
+            grid.save_nanovdb(temp.name, names=names, compressed=True)
+            grid2, data2, names2 = fvdb.GridBatch.from_nanovdb(temp.name, device=device)
+
+            names = [""] * batch_size
+
+            self.assertTrue(names == names2, f"{names}, {names2}")
+
+            for bi in range(batch_size):
+                self.assertEqual(data2.jdata.numel(), 0)
+                self.assertTrue(data2.joffsets.shape[0] == (batch_size + 1))
+                self.assertTrue(data2.joffsets[bi].item() == 0)
+                self.assertTrue(data2.joffsets[bi + 1].item() == 0)
+                self.assertTrue(data2.jidx.numel() == 0)
+
+            # NOTE: (@fwilliams) For some reason, when we build on the GPU, things get reordered when we load.
+            # This is due to a bug in NanoVDB. We can't test for equality, but we can test for equivalence.
+            if device == "cuda":
+                for bi in range(batch_size):
+                    grid_ijk_i = grid.ijk[bi].jdata
+                    grid2_ijk_i = grid2.ijk[bi].jdata
+
+                    grid_ijk_i_list = [tuple(grid_ijk_i[i].cpu().numpy().tolist()) for i in range(grid_ijk_i.shape[0])]
+                    grid2_ijk_i_list = [
+                        tuple(grid2_ijk_i[i].cpu().numpy().tolist()) for i in range(grid2_ijk_i.shape[0])
+                    ]
+                    self.assertTrue(set(grid_ijk_i_list) == set(grid2_ijk_i_list))
+
+                    # FIXME: (@fwilliams) -- This will fail because of a bug in NanoVDB
+                    # self.assertTrue(grid_i_dict == grid2_i_dict)
+            else:
+                self.assertTrue(torch.all(grid.ijk.jdata == grid2.ijk.jdata))
+
+    @parameterized.expand(["cpu", "cuda"])
+    def test_save_and_load_empty_gridbatch(self, device):
+        # No grids at all: saving without data writes the one voxel-less sentinel grid the empty
+        # batch's storage holds, and loading it back yields one empty grid (the behaviour before
+        # the storage flip). Saving *with* data has nothing to attach the data to and is an error.
+        grid = fvdb.GridBatch.from_zero_grids(device=device)
+        with tempfile.NamedTemporaryFile(suffix=".nvdb") as temp:
+            grid.save_nanovdb(temp.name)
+            grid2, data2, names2 = fvdb.GridBatch.from_nanovdb(temp.name, device=device)
+            self.assertEqual(grid2.grid_count, 1)
+            self.assertEqual(grid2.total_voxels, 0)
+        with self.assertRaises(ValueError):
+            grid.save_nanovdb("unused.nvdb", grid.jagged_like(torch.zeros(0, 3, device=device)))
+
+    @parameterized.expand(["cpu", "cuda"])
+    def test_save_and_load_with_empty_grid_in_batch(self, device):
+        # A batch whose middle grid has no voxels, exported as typed float grids: the empty member
+        # must round-trip as an empty grid rather than crash the CUDA converter.
+        ijk = fvdb.JaggedTensor(
+            [
+                torch.randint(-4, 4, (30, 3), device=device, dtype=torch.int32),
+                torch.empty(0, 3, device=device, dtype=torch.int32),
+                torch.randint(-4, 4, (20, 3), device=device, dtype=torch.int32),
+            ]
+        )
+        grid = fvdb.GridBatch.from_ijk(ijk)
+        self.assertEqual(grid.num_voxels[1].item(), 0)
+        data = grid.jagged_like(torch.randn(grid.total_voxels, device=device))
+        with tempfile.NamedTemporaryFile(suffix=".nvdb") as temp:
+            grid.save_nanovdb(temp.name, data)
+            grid2, data2, _ = fvdb.GridBatch.from_nanovdb(temp.name, device=device)
+            self.assertEqual(grid2.grid_count, 3)
+            self.assertEqual(grid2.num_voxels[1].item(), 0)
+            self.assertEqual(grid2.total_voxels, grid.total_voxels)
+            self.assertTrue(torch.allclose(data2.jdata.flatten(), data.jdata))
+
+    def test_load_gridbatch_basic(self):
+        datadir = get_fvdb_test_data_path()
+        # Load an uncompressed gridbatch
+        grids, data, names = fvdb.GridBatch.from_nanovdb(str(datadir / "io" / "batch.nvdb"))
+        # Load a blosc-compressed gridbatch
+        grids, data, names = fvdb.GridBatch.from_nanovdb(str(datadir / "io" / "smoke-blosc.nvdb"))
+
+    @parameterized.expand(["cpu", "cuda"])
+    def test_name_too_long_raises(self, device):
+        for batch_size in (1, 3):
+            sizes = [np.random.randint(100, 200) for _ in range(batch_size)]
+            grid_ijk = fvdb.JaggedTensor([torch.randint(-512, 512, (sizes[i], 3)) for i in range(batch_size)]).to(
+                device
+            )
+            grid = fvdb.GridBatch.from_ijk(grid_ijk)
+            with self.assertRaises(ValueError):
+                grid.save_nanovdb("temp.nvdb", grid_ijk, compressed=True, names=["a" * 1000] * batch_size)
+
+    @parameterized.expand(["cpu", "cuda"])
+    def test_bad_length_raises(self, device):
+        for batch_size in (1, 4):
+            sizes = [np.random.randint(100, 200) for _ in range(batch_size)]
+            grid_ijk = fvdb.JaggedTensor([torch.randint(-512, 512, (sizes[i], 3)) for i in range(batch_size)]).to(
+                device
+            )
+            grid = fvdb.GridBatch.from_ijk(grid_ijk)
+            grid_data = fvdb.JaggedTensor(
+                [torch.rand(int(grid.num_voxels[i].item()) + (-1) ** (i % 2) * 2).to(device) for i in range(batch_size)]
+            )
+            if batch_size % 2 == 0:
+                self.assertEqual(grid_data.jdata.shape[0], grid.total_voxels)
+            with tempfile.NamedTemporaryFile() as temp:
+                with self.assertRaises(ValueError):
+                    grid.save_nanovdb(temp.name, grid_data, compressed=True, names=["a"] * batch_size)
+
+            sizes = [np.random.randint(100, 200) for _ in range(batch_size)]
+            grid_ijk = fvdb.JaggedTensor([torch.randint(-512, 512, (sizes[i], 3)) for i in range(batch_size)]).to(
+                device
+            )
+            grid = fvdb.GridBatch.from_ijk(grid_ijk)
+            grid_data = fvdb.JaggedTensor(
+                [
+                    torch.rand(int(grid.num_voxels[i].item()) + (-1) ** (i % 2) * 2, 3, 3).to(device)
+                    for i in range(batch_size)
+                ]
+            )
+            if batch_size % 2 == 0:
+                self.assertEqual(grid_data.jdata.shape[0], grid.total_voxels)
+            with tempfile.NamedTemporaryFile() as temp:
+                with self.assertRaises(ValueError):
+                    grid.save_nanovdb(temp.name, grid_data, compressed=True, names=["a"] * batch_size)
+
+    @parameterized.expand(["cpu", "cuda"])
+    def test_bad_device_raises(self, device):
+        bad_device = "cpu" if device == "cuda" else "cuda"
+        for batch_size in (1, 4):
+            sizes = [np.random.randint(100, 200) for _ in range(batch_size)]
+            grid_ijk = fvdb.JaggedTensor([torch.randint(-512, 512, (sizes[i], 3)) for i in range(batch_size)]).to(
+                device
+            )
+            grid = fvdb.GridBatch.from_ijk(grid_ijk)
+            grid_data = fvdb.JaggedTensor(
+                [torch.rand(int(grid.num_voxels[i].item())).to(bad_device) for i in range(batch_size)]
+            )
+            with self.assertRaises(ValueError):
+                grid.save_nanovdb("temp.nvdb", grid_data, compressed=True, names=["a"] * batch_size)
+
+    @parameterized.expand(["cpu", "cuda"])
+    def test_bad_names_raises(self, device):
+        for batch_size in (1, 4):
+            sizes = [np.random.randint(100, 200) for _ in range(batch_size)]
+            grid_ijk = fvdb.JaggedTensor([torch.randint(-512, 512, (sizes[i], 3)) for i in range(batch_size)]).to(
+                device
+            )
+            grid = fvdb.GridBatch.from_ijk(grid_ijk)
+            grid_data = fvdb.JaggedTensor(
+                [torch.rand(int(grid.num_voxels[i].item())).to(device) for i in range(batch_size)]
+            )
+            names = ["aaa"] * (batch_size + 1)
+            with tempfile.NamedTemporaryFile() as temp:
+                with self.assertRaises(ValueError):
+                    grid.save_nanovdb(temp.name, grid_data, compressed=True, names=names)
+
+    @parameterized.expand(["cpu", "cuda"])
+    def test_nonexistent_name_raises(self, device):
+        for batch_size in (1, 3):
+            sizes = [np.random.randint(100, 200) for _ in range(batch_size)]
+            grid_ijk = fvdb.JaggedTensor([torch.randint(-512, 512, (sizes[i], 3)) for i in range(batch_size)]).to(
+                device
+            )
+            grid = fvdb.GridBatch.from_ijk(grid_ijk)
+            # data = fvdb.JaggedTensor([torch.rand(grid.num_voxels[i].item()).to(device) for i in range(batch_size)])
+            with tempfile.NamedTemporaryFile() as temp:
+                grid.save_nanovdb(temp.name, compressed=True, names=[f"a_{i}" for i in range(batch_size)])
+
+                with self.assertRaises(IndexError):
+                    fvdb.GridBatch.from_nanovdb(temp.name, device=device, names=["a_0", "b", "a_1", "a_0"])
+
+                with self.assertRaises(IndexError):
+                    fvdb.GridBatch.from_nanovdb(temp.name, device=device, name="c")
+
+    @parameterized.expand(["cpu", "cuda"])
+    def test_one_voxel_grids(self, device):
+        for batch_size in (1, 3):
+            sizes = [1 for _ in range(batch_size)]
+            grid_ijk = fvdb.JaggedTensor([torch.randint(-512, 512, (sizes[i], 3)) for i in range(batch_size)]).to(
+                device
+            )
+            grid = fvdb.GridBatch.from_ijk(grid_ijk)
+            data = fvdb.JaggedTensor([torch.rand(1).squeeze().to(device)] * batch_size)
+            with tempfile.NamedTemporaryFile() as temp:
+                grid.save_nanovdb(temp.name, data, compressed=False)
+                grid2, data2, names = fvdb.GridBatch.from_nanovdb(temp.name, device=device)
+                self.assertTrue(torch.all(grid2.ijk.jdata == grid.ijk.jdata))
+                self.assertTrue(torch.all(data2.jdata == data.jdata))
+
+            sizes = [1 for _ in range(batch_size)]
+            grid_ijk = fvdb.JaggedTensor([torch.randint(-512, 512, (sizes[i], 3)) for i in range(batch_size)]).to(
+                device
+            )
+            grid = fvdb.GridBatch.from_ijk(grid_ijk)
+            data = fvdb.JaggedTensor([torch.rand(1).unsqueeze(-1).unsqueeze(-1).to(device)] * batch_size)
+            with tempfile.NamedTemporaryFile() as temp:
+                grid.save_nanovdb(temp.name, data, compressed=False)
+                grid2, data2, names = fvdb.GridBatch.from_nanovdb(temp.name, device=device)
+                self.assertTrue(torch.all(grid2.ijk.jdata == grid.ijk.jdata))
+                self.assertTrue(torch.all(data2.jdata == data.jdata))
+
+    @parameterized.expand(["cpu", "cuda"])
+    def test_voxelsize_and_origin(self, device):
+        torch.manual_seed(0)
+        np.random.seed(0)
+
+        pts = fvdb.JaggedTensor([torch.rand((100, 3)) for _ in range(8)]).to(device)
+
+        test_grid = fvdb.GridBatch.from_points(
+            pts,
+            voxel_sizes=[np.random.random() + 0.00001 for _ in range(3)],
+            origins=[np.random.randint(-100, 100) for _ in range(3)],
+        )
+
+        with tempfile.NamedTemporaryFile() as temp:
+            # test saving index grids by themselves which will be written as a NanoVDB index grid
+            test_grid.save_nanovdb(temp.name)
+            test_grid_from_file, _, _ = fvdb.GridBatch.from_nanovdb(temp.name, device=device)
+
+            self.assertTrue(torch.all(test_grid.voxel_sizes == test_grid_from_file.voxel_sizes))
+            self.assertTrue(torch.all(test_grid.origins == test_grid_from_file.origins))
+
+            # test saving index grids with data of a channel size which will be written as a NanoVDB data grid
+            data = test_grid.jagged_like(torch.rand(test_grid.total_voxels, 3, device=device))
+            test_grid.save_nanovdb(temp.name, data)
+            test_grid_from_file, data_from_file, _ = fvdb.GridBatch.from_nanovdb(temp.name, device=device)
+
+            self.assertTrue(torch.all(test_grid.voxel_sizes == test_grid_from_file.voxel_sizes))
+            self.assertTrue(torch.all(test_grid.origins == test_grid_from_file.origins))
+
+    @parameterized.expand(_voxelsize_standard_type_params)
+    def test_voxelsize_preserved_with_standard_nanovdb_types(self, device, dtype_and_channels):
+        """Issue #123: all standard NanoVDB data types should preserve voxel size and origin."""
+        dtype, channels = dtype_and_channels
+        torch.manual_seed(0)
+        np.random.seed(0)
+
+        pts = fvdb.JaggedTensor([torch.rand((100, 3)) for _ in range(4)]).to(device)
+        voxel_sizes = [0.1, 0.2, 0.3]
+        origins = [1.0, -2.0, 3.0]
+
+        test_grid = fvdb.GridBatch.from_points(pts, voxel_sizes=voxel_sizes, origins=origins)
+        n = test_grid.total_voxels
+
+        if dtype in (torch.int32, torch.int64):
+            if channels > 1:
+                raw = torch.randint(0, 100, (n, channels), dtype=dtype, device=device)
+            else:
+                raw = torch.randint(0, 100, (n,), dtype=dtype, device=device)
+        elif dtype == torch.uint8:
+            raw = torch.randint(0, 256, (n, channels), dtype=dtype, device=device)
+        else:
+            if channels > 1:
+                raw = (torch.rand(n, channels, device=device) * 100).to(dtype)
+            else:
+                raw = (torch.rand(n, device=device) * 100).to(dtype)
+
+        data = test_grid.jagged_like(raw)
+
+        with tempfile.NamedTemporaryFile() as temp:
+            test_grid.save_nanovdb(temp.name, data)
+            loaded_grid, _, _ = fvdb.GridBatch.from_nanovdb(temp.name, device=device)
+
+            self.assertTrue(
+                torch.all(test_grid.voxel_sizes == loaded_grid.voxel_sizes),
+                f"Voxel sizes not preserved for dtype={dtype}, channels={channels}: "
+                f"{test_grid.voxel_sizes} vs {loaded_grid.voxel_sizes}",
+            )
+            self.assertTrue(
+                torch.all(test_grid.origins == loaded_grid.origins),
+                f"Origins not preserved for dtype={dtype}, channels={channels}: "
+                f"{test_grid.origins} vs {loaded_grid.origins}",
+            )
+
+    @parameterized.expand(_voxelsize_nonstandard_shape_params)
+    def test_voxelsize_preserved_with_nonstandard_shapes(self, device, dtype_and_shape):
+        """Issue #123: non-standard shapes (TensorGrid/blind data path) should preserve voxel size and origin."""
+        dtype, extra_dims = dtype_and_shape
+        torch.manual_seed(0)
+        np.random.seed(0)
+
+        pts = fvdb.JaggedTensor([torch.rand((100, 3)) for _ in range(4)]).to(device)
+        voxel_sizes = [0.1, 0.2, 0.3]
+        origins = [1.0, -2.0, 3.0]
+
+        test_grid = fvdb.GridBatch.from_points(pts, voxel_sizes=voxel_sizes, origins=origins)
+        n = test_grid.total_voxels
+        shape = (n,) + extra_dims
+
+        if dtype in (torch.int32, torch.int64):
+            raw = torch.randint(0, 100, shape, dtype=dtype, device=device)
+        else:
+            raw = (torch.rand(*shape, device=device) * 100).to(dtype)
+
+        data = test_grid.jagged_like(raw)
+
+        with tempfile.NamedTemporaryFile() as temp:
+            test_grid.save_nanovdb(temp.name, data)
+            loaded_grid, _, _ = fvdb.GridBatch.from_nanovdb(temp.name, device=device)
+
+            self.assertTrue(
+                torch.all(test_grid.voxel_sizes == loaded_grid.voxel_sizes),
+                f"Voxel sizes not preserved for dtype={dtype}, shape={extra_dims}: "
+                f"{test_grid.voxel_sizes} vs {loaded_grid.voxel_sizes}",
+            )
+            self.assertTrue(
+                torch.all(test_grid.origins == loaded_grid.origins),
+                f"Origins not preserved for dtype={dtype}, shape={extra_dims}: "
+                f"{test_grid.origins} vs {loaded_grid.origins}",
+            )
+
+    @parameterized.expand(["cpu", "cuda"])
+    def test_voxelsize_preserved_with_different_scales_per_grid(self, device):
+        """Issue #123: batches with per-grid voxel sizes should preserve each grid's transform."""
+        torch.manual_seed(0)
+        np.random.seed(0)
+
+        batch_size = 4
+        per_grid_voxel_sizes = [
+            [0.1, 0.1, 0.1],
+            [0.15, 0.15, 0.15],
+            [0.05, 0.1, 0.2],
+            [0.3, 0.3, 0.3],
+        ]
+        per_grid_origins = [
+            [0.0, 0.0, 0.0],
+            [1.0, 2.0, 3.0],
+            [-1.0, 0.5, -0.5],
+            [10.0, -10.0, 0.0],
+        ]
+
+        pts = fvdb.JaggedTensor([torch.rand((100, 3)) for _ in range(batch_size)]).to(device)
+        test_grid = fvdb.GridBatch.from_points(
+            pts,
+            voxel_sizes=per_grid_voxel_sizes,
+            origins=per_grid_origins,
+        )
+
+        data = test_grid.jagged_like(torch.rand(test_grid.total_voxels, device=device))
+
+        with tempfile.NamedTemporaryFile() as temp:
+            test_grid.save_nanovdb(temp.name, data)
+            loaded_grid, _, _ = fvdb.GridBatch.from_nanovdb(temp.name, device=device)
+
+            for bi in range(batch_size):
+                self.assertTrue(
+                    torch.all(test_grid.voxel_sizes[bi] == loaded_grid.voxel_sizes[bi]),
+                    f"Grid {bi} voxel sizes mismatch: {test_grid.voxel_sizes[bi]} vs {loaded_grid.voxel_sizes[bi]}",
+                )
+                self.assertTrue(
+                    torch.all(test_grid.origins[bi] == loaded_grid.origins[bi]),
+                    f"Grid {bi} origins mismatch: {test_grid.origins[bi]} vs {loaded_grid.origins[bi]}",
+                )
+
+
+_MIXED_TYPES_FIXTURE_REL = ("io", "mixed_types.nvdb")
+
+# Description of every grid in the committed ``mixed_types.nvdb`` fixture:
+# (index, name, nanovdb type string, nanovdb grid_class string,
+#  torch dtype, trailing shape, expected voxel value).
+_MIXED_TYPES_GRIDS = [
+    (0, "density", "float", "FOG", torch.float32, 1, 1.5),
+    (1, "pressure", "double", "FOG", torch.float64, 1, 2.25),
+    (2, "label", "int32", "?", torch.int32, 1, 7),
+    (3, "velocity", "Vec3f", "?", torch.float32, 3, (1.0, 2.0, 3.0)),
+]
+
+_MIXED_TYPES_BY_NAME_PARAMS = list(
+    itertools.product(
+        ["cpu", "cuda"],
+        [(name, dtype, trailing, value) for _, name, _, _, dtype, trailing, value in _MIXED_TYPES_GRIDS],
+    )
+)
+
+_MIXED_TYPES_BY_INDEX_PARAMS = list(
+    itertools.product(
+        ["cpu", "cuda"],
+        [(index, name, dtype, trailing) for index, name, _, _, dtype, trailing, _ in _MIXED_TYPES_GRIDS],
+    )
+)
+
+
+class TestLoadMixedTypeNanovdb(unittest.TestCase):
+    """Tests for reading .nvdb files that contain grids of multiple value types.
+
+    Uses the committed fixture ``unit_tests/io/mixed_types.nvdb`` from
+    fvdb-test-data, which contains four single-voxel grids of differing value
+    types:
+
+      * ``density``  - ``float``  FogVolume, value ``1.5``
+      * ``pressure`` - ``double`` FogVolume, value ``2.25``
+      * ``label``    - ``int32``  Unknown,   value ``7``
+      * ``velocity`` - ``Vec3f``  Unknown,   value ``(1.0, 2.0, 3.0)``
+
+    Together these exercise:
+
+      * ``fvdb.functional.read_nanovdb_metadata`` / ``grid_names_in_nanovdb``
+        on mixed-type content,
+      * the ``validateTrailingShapeAndDtype`` error raised from ``fromNVDB``
+        when the caller tries to load the whole file into one GridBatch,
+      * ``name=`` / ``index=`` selection for each of the four NanoVDB value
+        types, including the non-``float`` cases that need the ``gridId``
+        parameter threaded into ``loadOneGrid``.
+    """
+
+    @classmethod
+    def _fixture_path(cls) -> str:
+        return str(get_fvdb_test_data_path().joinpath(*_MIXED_TYPES_FIXTURE_REL))
+
+    def test_read_metadata_enumerates_all_grids(self):
+        meta = fvdb.functional.read_nanovdb_metadata(self._fixture_path())
+        self.assertEqual(len(meta), len(_MIXED_TYPES_GRIDS))
+
+        by_name = {m.name: m for m in meta}
+        for _, name, type_str, grid_class, _, _, _ in _MIXED_TYPES_GRIDS:
+            self.assertIn(name, by_name)
+            m = by_name[name]
+            self.assertEqual(m.type, type_str, f"unexpected type for grid {name!r}")
+            self.assertEqual(m.grid_class, grid_class, f"unexpected grid_class for grid {name!r}")
+            self.assertEqual(m.voxel_count, 1, f"unexpected voxel_count for grid {name!r}")
+            # The fixture is authored as four single-voxel grids at the origin
+            # with default unit voxel size, so every grid should report the
+            # same voxel_size and a degenerate index_bbox of (0, 0, 0).
+            self.assertEqual(tuple(m.voxel_size), (1.0, 1.0, 1.0), f"unexpected voxel_size for grid {name!r}")
+            self.assertEqual(tuple(m.index_bbox_min), (0, 0, 0), f"unexpected index_bbox_min for grid {name!r}")
+            self.assertEqual(tuple(m.index_bbox_max), (0, 0, 0), f"unexpected index_bbox_max for grid {name!r}")
+
+    def test_grid_names_in_nanovdb(self):
+        names = fvdb.functional.grid_names_in_nanovdb(self._fixture_path())
+        self.assertEqual(sorted(names), sorted(name for _, name, *_ in _MIXED_TYPES_GRIDS))
+
+    def test_load_whole_mixed_type_file_raises_actionable_error(self):
+        with self.assertRaises(ValueError) as ctx:
+            fvdb.GridBatch.from_nanovdb(self._fixture_path())
+        msg = str(ctx.exception)
+        self.assertIn("mixed value type", msg.lower())
+        # The error should mention at least one of the grid names as one of
+        # the mismatched entries.
+        self.assertTrue(
+            any(name in msg for _, name, *_ in _MIXED_TYPES_GRIDS),
+            f"Expected error to reference one of the grid names: {msg!r}",
+        )
+        # The error should describe the workaround: load grids one at a time using a
+        # name or index selector. We accept any phrasing that mentions both "name" and
+        # "index" alongside the word "selector(s)", which is the wording produced by
+        # validateTrailingShapeAndDtype in src/fvdb/detail/io/LoadNanovdb.cpp.
+        msg_lower = msg.lower()
+        self.assertTrue(
+            "name" in msg_lower and "index" in msg_lower and "selector" in msg_lower,
+            f"Expected actionable workaround hint in error message: {msg!r}",
+        )
+
+    @parameterized.expand(_MIXED_TYPES_BY_NAME_PARAMS)
+    def test_load_single_grid_by_name(self, device, grid_spec):
+        name, expected_dtype, trailing, expected_value = grid_spec
+        _, data, names = fvdb.GridBatch.from_nanovdb(self._fixture_path(), name=name, device=device)
+
+        self.assertEqual(names, [name])
+        self.assertEqual(data.jdata.dtype, expected_dtype)
+        self.assertEqual(data.jdata.device.type, device.split(":")[0])
+        self.assertEqual(data.jdata.dim(), 2)
+        self.assertEqual(data.jdata.size(0), 1)
+        self.assertEqual(data.jdata.size(-1), trailing)
+
+        row = data.jdata[0].cpu().tolist()
+        if trailing == 1:
+            self.assertAlmostEqual(row[0], expected_value, places=5)
+        else:
+            self.assertEqual(len(row), len(expected_value))
+            for got, want in zip(row, expected_value):
+                self.assertAlmostEqual(got, want, places=5)
+
+    @parameterized.expand(_MIXED_TYPES_BY_INDEX_PARAMS)
+    def test_load_single_grid_by_index(self, device, grid_spec):
+        index, expected_name, expected_dtype, trailing = grid_spec
+        _, data, names = fvdb.GridBatch.from_nanovdb(self._fixture_path(), index=index, device=device)
+
+        self.assertEqual(names, [expected_name])
+        self.assertEqual(data.jdata.dtype, expected_dtype)
+        self.assertEqual(data.jdata.device.type, device.split(":")[0])
+        self.assertEqual(data.jdata.dim(), 2)
+        self.assertEqual(data.jdata.size(0), 1)
+        self.assertEqual(data.jdata.size(-1), trailing)
+
+        expected_value = next(value for idx, _, _, _, _, _, value in _MIXED_TYPES_GRIDS if idx == index)
+        row = data.jdata[0].cpu().tolist()
+        if trailing == 1:
+            self.assertAlmostEqual(row[0], expected_value, places=5)
+        else:
+            self.assertEqual(len(row), len(expected_value))
+            for got, want in zip(row, expected_value):
+                self.assertAlmostEqual(got, want, places=5)
+
+
+if __name__ == "__main__":
+    unittest.main()

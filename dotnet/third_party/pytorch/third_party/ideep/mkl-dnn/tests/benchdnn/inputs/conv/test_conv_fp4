@@ -1,0 +1,2 @@
+--reset --mb=1 --dt=f4_e2m1:f4_e2m1:bf16 --dir=fwd_d --wtag=xba --batch=shapes_4bit
+--reset --mb=1 --dt=f4_e2m1 --dir=fwd_d --wtag=xba --batch=shapes_4bit

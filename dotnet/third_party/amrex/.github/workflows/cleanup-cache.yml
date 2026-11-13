@@ -1,0 +1,69 @@
+name: CleanUpCache
+
+on:
+  workflow_run:
+    workflows: [bittree, LinuxClang, cuda, LinuxFlang, LinuxGCC, hip, Hypre, intel, macos, PETSc, SUNDIALS, CodeQL, smoke, apps]
+    types:
+      - completed
+
+permissions:
+  contents: read
+
+jobs:
+  CleanUpCcacheCache:
+    name: Clean Up Ccache Cache for ${{ github.event.workflow_run.name }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Clean up ccache
+        run: |
+          REPO=${{ github.repository }}
+
+          # push or pull_request or schedule or ...
+          EVENT=${{ github.event.workflow_run.event }}
+
+          # Triggering workflow run name (e.g., LinuxClang)
+          WORKFLOW_NAME="${{ github.event.workflow_run.name }}"
+
+          # For debugging, cat ${GITHUB_EVENT_PATH} to see the payload.
+
+          if [[ $EVENT == "pull_request" ]]; then
+            pr_head_sha=${{ github.event.workflow_run.head_sha }}
+            pr_number=$(gh pr list --search $pr_head_sha --json number --jq '.[0].number')
+            echo "Clean up cache for PR ${pr_number}"
+            BRANCH=refs/pull/${pr_number}/merge
+          else
+            BRANCH=refs/heads/${{ github.event.workflow_run.head_branch }}
+          fi
+
+          # Setting this to not fail the workflow while deleting cache keys.
+          set +e
+
+          # In our cache keys, substring after `-git-` is git hash, substring
+          # before that is a unique id for jobs (e.g., `ccache-LinuxClang-configure-2d`).
+          # The goal is to keep the last used key of each job and delete all others.
+
+          # something like ccache-LinuxClang-
+          keyprefix="ccache-${WORKFLOW_NAME}-"
+
+          cached_jobs=$(gh cache list -L 100 -R $REPO --ref $BRANCH --key "$keyprefix" --json key --jq '.[].key' | awk -F '-git-' '{print $1}' | sort | uniq)
+
+          # cached_jobs is something like "ccache-LinuxClang-configure-1d ccache-LinuxClang-configure-2d".
+          # It might also contain spaces. Thus we set IFS to \n.
+          IFS=$'\n'
+          for j in $cached_jobs
+          do
+            # Delete all entries except the last used one. Note that `gh cache
+            # delete` has no ref filter, so we delete by cache id, not by key.
+            old_ids=$(gh cache list -L 100 -R $REPO --ref $BRANCH --key "${j}-git-" --sort last_accessed_at --order desc --json id --jq '.[].id' | tail -n +2)
+            for i in $old_ids
+            do
+              gh cache delete "$i" -R $REPO || true
+            done
+          done
+          unset IFS

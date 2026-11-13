@@ -1,0 +1,106 @@
+#ifndef MY_TEST_H_
+#define MY_TEST_H_
+#ifdef AMREX_USE_HYPRE
+#include <AMReX_Hypre.H>
+#endif
+
+#include <AMReX_MLMG.H>
+
+// Solve `div dot (sigma grad phi) = rhs` using the nodal solver
+
+class MyTest // NOLINT(clang-analyzer-optin.performance.Padding)
+{
+public:
+
+    MyTest ();
+
+    void solve ();
+    void compute_norms () const;
+    void writePlotfile () const;
+
+    void initData ();
+
+    [[nodiscard]] int getNumTrials () const { return num_trials; }
+    [[nodiscard]] int getDoPlots () const { return do_plots; }
+    [[nodiscard]] amrex::Vector<std::string> const& getMultigridTypes () const {
+        return multigrid_types;
+    }
+    void setMultigridType (std::string const& name);
+
+private:
+
+    void readParameters ();
+    void testSigmaUpdate ();
+
+    int max_level = 1;
+    int ref_ratio = 2;
+    amrex::IntVect n_cell{AMREX_D_DECL(128,128,128)};
+    int max_grid_size = 64;
+    amrex::Real domain_ratio = 1.0;
+
+    bool composite_solve = true;
+    bool use_gmres = false;
+
+    // For MLMG solver
+    int verbose = 2;
+    int bottom_verbose = 0;
+    int max_iter = 100;
+    int max_fmg_iter = 0;
+    amrex::Real reltol = amrex::Real(1.e-11);
+    int gpu_regtest = 0;
+
+
+    bool agglomeration = false;
+    bool consolidation = false;
+    bool semicoarsening = false;
+    bool mixed_precision = false;
+    // known nodes in a ball at the domain center on all levels; composite solve only
+    bool overset = false;
+    // if positive: abort if the max-norm error exceeds it
+    amrex::Real max_error = -1.0;
+    int max_coarsening_level = 30;
+    int max_semicoarsening_level = 0;
+    //int smooth_num_sweeps = 4;
+
+    bool use_hypre = false;
+    bool use_mlhypre = false;  // composite solve with HypreMLNodeLap, compared with MLMG
+    int periodic = 0;          // periodic domain (singular problem); composite solve only
+    std::string mlhypre_prefix = "hypre_mlnodelap";
+    // if positive: abort if max |HypreMLNodeLap - MLMG| exceeds it relative to max |MLMG|
+    amrex::Real mlhypre_max_diff = -1.0;
+    // mlhypre: the solve must throw with a NaN rhs (1) or a NaN initial
+    // guess, i.e. NaN Dirichlet values (2)
+    int mlhypre_test_throw = 0;
+    // the fine levels touch the low-x (Dirichlet) domain face, so that
+    // hanging nodes interpolate from coarse Dirichlet nodes
+    int fine_at_boundary = 0;
+    // mlhypre: solve for u = 1 (unit Dirichlet values, zero rhs) and compare
+    // with it instead of MLMG
+    int const_solution = 0;
+    // mlhypre: NaN rhs at the Dirichlet domain nodes, which must not be used
+    int mlhypre_nan_dirichlet_rhs = 0;
+    amrex::Vector<std::string> multigrid_types{"geometric"};
+    amrex::MultigridType multigrid_type = amrex::MultigridType::geometric;
+    //! Testing aid, not for normal use: a non-negative value overrides the
+    //! hybrid stall rate; 0 forces the switch to AlgMG.
+    amrex::Real hybrid_stall_rate = -1.0;
+    bool do_plots = true;
+    int num_trials = 1;
+    bool test_sigma_update = false;
+
+#ifdef AMREX_USE_HYPRE
+    int hypre_interface_i = 1;  // 1. structed, 2. semi-structed, 3. ij
+    amrex::Hypre::Interface hypre_interface = amrex::Hypre::Interface::structed;
+#endif
+
+    amrex::Vector<amrex::Geometry> geom;
+    amrex::Vector<amrex::BoxArray> grids;
+    amrex::Vector<amrex::DistributionMapping> dmap;
+
+    amrex::Vector<amrex::MultiFab> solution;
+    amrex::Vector<amrex::MultiFab> rhs;
+    amrex::Vector<amrex::MultiFab> exact_solution;
+    amrex::Vector<amrex::MultiFab> sigma;
+};
+
+#endif

@@ -1,0 +1,456 @@
+.. role:: cpp(code)
+   :language: c++
+
+.. _sec:FFT:r2c:
+
+FFT::R2C Class
+==============
+
+Class template `FFT::R2C` supports discrete Fourier transforms between real
+and complex data across MPI processes. The name R2C indicates that the
+forward transform converts real data to complex data, while the backward
+transform converts complex data to real data. It should be noted that both
+directions of transformation are supported, not just from real to complex.
+
+The implementation utilizes cuFFT, rocFFT, oneMKL and FFTW, for CUDA, HIP,
+SYCL and CPU builds, respectively. Because the parallel communication is
+handled by AMReX, it does not need the parallel version of
+FFTW. Furthermore, there is no constraint on the domain decomposition such
+as one Box per process. This class performs parallel FFT on AMReX's parallel
+data containers (e.g., :cpp:`MultiFab` and
+:cpp:`FabArray<BaseFab<ComplexData<Real>>>`.
+
+Other than using column-major order, AMReX follows the convention of
+FFTW. Applying the forward transform followed by the backward transform
+scales the original data by the size of the input array. The layout of the
+complex data also follows the FFTW convention, where the complex Hermitian
+output array has `(nx/2+1,ny,nz)` elements. Here `nx`, `ny` and `nz` are the
+sizes of the real array and the division is rounded down.
+
+Below are examples of using :cpp:`FFT::R2C`.
+
+.. highlight:: c++
+
+::
+
+    Geometry geom(...);
+    MultiFab mfin(...);
+    MultiFab mfout(...);
+
+    auto scaling = 1. / geom.Domain().d_numPts();
+
+    FFT::R2C r2c(geom.Domain());
+    r2c.forwardThenBackward(mfin, mfout,
+        [=] AMREX_GPU_DEVICE (int, int, int, auto& sp)
+        {
+            sp *= scaling;
+        });
+
+    // Use R2C provided spectral data layout.
+    auto const& [cba, cdm] = r2c.getSpectralDataLayout();
+    cMultiFab cmf(cba, cdm, 1, 0);
+    FFT::R2C<Real,FFT::Direction::forward> r2c_forward(geom.Domain());
+    r2c_forward(mfin, cmf);
+
+    FFT::R2C<Real,FFT::Direction::backward> r2c_backward(geom.Domain());
+    r2c_backward(cmf, mfout);
+
+Note that using :cpp:`forwardThenBackward` is expected to be more efficient
+than separate calls to :cpp:`forward` and :cpp:`backward` because some
+parallel communication can be avoided. For the spectral data, the example
+above builds :cpp:`cMultiFab` using :cpp:`FFT::R2C` provided layout. You can
+also use your own :cpp:`BoxArray` and :cpp:`DistributionMapping`, but it
+might result in extra communication. It should also be noted that a lot of
+preparatory work is done in the construction of an :cpp:`FFT::R2C`
+object. Therefore, one should cache it for reuse if possible. Although
+:cpp:`FFT::R2C` does not have a default constructor, one could always use
+:cpp:`std::unique_ptr<FFT::R2C<Real>>` to store an object in one's class.
+
+Choosing FFT lengths
+--------------------
+
+:cpp:`FFT::nextFastLen(target, nfactors)` returns the smallest FFT length
+greater than or equal to :cpp:`target` whose prime factors are limited to the
+first :cpp:`nfactors` values from :cpp:`{2, 3, 5, 7, 11, 13}`. If
+:cpp:`nfactors` is omitted, :cpp:`FFT::FastNumPrimeFactors()` provides the
+platform-dependent default. It currently returns 5 for CUDA and 6 for other
+backends. This default is a performance tuning policy and may change in the
+future. This helper can be used to choose a padded FFT domain size that is
+expected to perform well with common FFT backends.
+
+
+Class template `FFT::R2C` also supports batched FFTs. The batch size is set
+in an :cpp:`FFT::Info` object passed to the constructor of
+:cpp:`FFT::R2C`. Below is an example.
+
+.. highlight:: c++
+
+::
+
+    int batch_size = 10;
+    Geometry geom(...);
+    MultiFab mf(ba, dm, batch_size, 0);
+
+    FFT::Info info{};
+    info.setBatchSize(batch_size));
+    FFT::R2C<Real,FFT::Direction::both> r2c(geom.Domain(), info);
+
+    auto const& [cba, cdm] = r2c.getSpectralDataLayout();
+    cMultiFab cmf(cba, cdm, batch_size, 0);
+
+    r2c.forward(mf, cmf);
+
+    // Do work on cmf.
+
+    r2c.backward(cmf, mf);
+
+Function :cpp:`forwardThenBackward` is also supported for a batched FFT. A
+callable taking a :cpp:`GpuComplex<Real>&` is called once for each component
+of the batch at each spectral point. When the components are coupled, such as
+when projecting a vector field in spectral space, the callable can take a
+:cpp:`CellData` argument instead, so that it receives all components of the
+batch at a given spectral point at once.
+
+.. highlight:: c++
+
+::
+
+    auto scaling = 1. / geom.Domain().d_numPts();
+
+    r2c.forwardThenBackward(mf, mf2,
+        [=] AMREX_GPU_DEVICE (int, int, int, CellData<GpuComplex<Real>> sp)
+        {
+            for (int n = 0; n < sp.nComp(); ++n) {
+                sp[n] *= scaling;
+            }
+        });
+
+The distributed FFT moves data between processes when it switches
+directions. :cpp:`FFT::Info::setCommStrategy` selects how:
+
+- :cpp:`FFT::CommStrategy::automatic` (default): AMReX chooses.
+- :cpp:`FFT::CommStrategy::pointtopoint`: individual messages between
+  pairs of processes.
+- :cpp:`FFT::CommStrategy::alltoallv`: one ``MPI_Alltoallv`` per exchange.
+- :cpp:`FFT::CommStrategy::alltoall`: one ``MPI_Alltoall`` per exchange.
+
+AMReX may use a different method when the requested one does not apply,
+for example on a single process.
+
+.. _sec:FFT:c2c:
+
+FFT::C2C Class
+==============
+
+:cpp:`FFT::C2C` is a class template that supports complex to complex Fourier
+transforms. It has a similar interface as :cpp:`FFT::R2C`.
+
+.. _sec:FFT:localr2c:
+
+FFT::LocalR2C Class
+===================
+
+Class template `FFT::LocalR2C` supports local discrete Fourier transforms
+between real and complex data. The name R2C indicates that the forward
+transform converts real data to complex data, while the backward transform
+converts complex data to real data. It should be noted that both directions
+of transformation are supported, not just from real to complex.
+
+Below is an example of using :cpp:`FFT::LocalR2C`.
+
+.. highlight:: c++
+
+::
+
+    MultiFab mf(...);
+    BaseFab<GpuComplex<T>> cfab;
+    for (MFIter mfi(mf); mfi.isValid(); ++mfi) {
+        FFT::LocalR2C fft(mfi.fabbox().length());
+        cfab.resize(IntVect(0), fft.spectralSize()-1);
+        fft.forward(mf[mfi].dataPtr(), cfab.dataPtr());
+    }
+
+
+Poisson Solver
+==============
+
+AMReX provides FFT-based Poisson solvers. Here, Poisson's equation is
+
+.. math::
+
+  \nabla^2 \phi = \rho.
+
+:cpp:`FFT::Poisson` supports periodic (:cpp:`FFT::Boundary::periodic`),
+homogeneous Neumann (:cpp:`FFT::Boundary::even`), and homogeneous Dirichlet
+(:cpp:`FFT::Boundary::odd`) boundaries using FFT. Below is an example of
+using the solver.
+
+.. highlight:: c++
+
+::
+
+    Geometry geom(...);
+    MultiFab soln(...);
+    MultiFab rhs(...);
+
+    Array<std::pair<FFT::Boundary,FFT::Boundary>,AMREX_SPACEDIM>
+            fft_bc{...};
+
+    bool has_dirichlet = false;
+    for (int idim = 0; idim < AMREX_SPACEDIM; ++idim) {
+        has_dirichlet = has_dirichlet ||
+            fft_bc[idim].first == FFT::Boundary::odd ||
+            fft_bc[idim].second == FFT::Boundary::odd;
+    }
+    if (! has_dirichlet) {
+        // Shift rhs so that its sum is zero.
+        auto rhosum = rhs.sum(0);
+        rhs.plus(-rhosum/geom.Domain().d_numPts(), 0, 1);
+    }
+
+    FFT::Poisson fft_poisson(geom, fft_bc);
+    fft_poisson.solve(soln, rhs);
+
+:cpp:`FFT::PoissonOpenBC` is a 3D only solver that supports open
+boundaries. Its implementation utilizes :cpp:`FFT::OpenBCSolver`, which can
+be used for implementing convolution based solvers with a user provided
+Green's function. If users want to extend the open BC solver to 2D or other
+types of Green's function, they could use :cpp:`FFT::PoissonOpenBC` as an
+example. Below is an example of solving Poisson's equation with open
+boundaries.
+
+:cpp:`FFT::OpenBCSolver` currently supports one right-hand-side component per
+solve. It does not support :cpp:`FFT::Info::setBatchSize` values greater than
+one. The solver uses an internal doubled convolution domain in each transformed
+direction. By default, the one-sided length is rounded up with
+:cpp:`FFT::nextFastLen(n)` before doubling, using the platform-dependent
+:cpp:`FFT::FastNumPrimeFactors()` default described above. This extra padding
+changes only the internal FFT work arrays, not the user-provided
+:cpp:`MultiFab` domains. Users can disable it with
+:cpp:`FFT::Info::setOpenBCPadding(false)` or tune the factor count with
+:cpp:`FFT::Info::setOpenBCPaddingNumPrimeFactors(nfactors)`.
+
+.. highlight:: c++
+
+::
+
+    Geometry geom(...);
+    MultiFab soln(...); // soln can be either nodal or cell-centered.
+    MultiFab rhs(...);  // rhs must have the same index type as soln.
+
+    int ng = ...; // ng can be non-zero, if we want to compute potential
+                  // outside the domain.
+    FFT::PoissonOpenBC openbc_solver(geom, soln.ixType(), IntVect(ng));
+    openbc_solver.solve(soln, rhs);
+
+:cpp:`FFT::PoissonHybrid` is a 3D only solver that supports Dirichlet and
+Neumann boundary in the last dimension. The last dimension is solved with a
+tridiagonal solver that can support non-uniform cell size in the
+z-direction. For most applications, :cpp:`FFT::Poisson` should be used.
+
+The Poisson solvers take an optional :cpp:`FFT::Info` argument, of which
+only the communication strategy set by :cpp:`FFT::Info::setCommStrategy`
+is used.
+
+Similar to :cpp:`FFT::R2C`, the Poisson solvers should be cached for reuse,
+and one might need to use :cpp:`std::unique_ptr<FFT::Poisson<MultiFab>>`
+because there is no default constructor.
+
+Stokes Solver
+=============
+
+AMReX provides an FFT-based Stokes solver for periodic domains in 2D and 3D.
+The generalized Stokes problem is
+
+.. math::
+
+  (\alpha - \eta \nabla^2) \mathbf{u} + \nabla p = \mathbf{f},
+
+with the divergence-free constraint enforced in Fourier space.
+Here, :math:`\mathbf{u}` is the velocity, :math:`p` is the pressure,
+:math:`\mathbf{f}` is the right-hand side, and :math:`\alpha` and
+:math:`\eta` are scalar coefficients.
+
+The solver uses a MAC staggered grid. The velocity components and their
+corresponding right-hand side components must be at x-face, y-face, and
+z-face centers, while the pressure is cell-centered. It currently only
+supports periodic boundary conditions.
+
+Below is an example of using the solver.
+
+.. highlight:: c++
+
+::
+
+    Geometry geom(...);
+    MultiFab pres(...);        // cell-centered
+    MultiFab u(...);           // at x-face centers
+    MultiFab v(...);           // at y-face centers
+    MultiFab w(...);           // at z-face centers
+    MultiFab rhsx(...);        // at x-face centers
+    MultiFab rhsy(...);        // at y-face centers
+    MultiFab rhsz(...);        // at z-face centers
+
+    FFT::Stokes stokes(geom);
+    stokes.solve(u, v, w, pres,                 // outputs
+                 rhsx, rhsy, rhsz, alpha, eta); // inputs
+
+Similar to the other FFT classes, the solver should be cached for reuse.
+
+.. _sec:FFT:crossproj:
+
+Cross-Stencil Projection
+========================
+
+:cpp:`FFT::CrossProj` projects a cell-centered velocity field onto fields
+that are divergence free with respect to a node-centered divergence. In 2D,
+the divergence at the node shared by cells :math:`(i,j)`, :math:`(i+1,j)`,
+:math:`(i,j+1)` and :math:`(i+1,j+1)` is
+
+.. math::
+
+  \frac{u_{i+1,j} + u_{i+1,j+1} - u_{i,j} - u_{i,j+1}}{2 \Delta x}
+  + \frac{v_{i,j+1} + v_{i+1,j+1} - v_{i,j} - v_{i+1,j}}{2 \Delta y}.
+
+In 3D, it is computed similarly from the 8 cells surrounding the node. The
+projected velocity has zero divergence at every node, and projecting it
+again leaves it unchanged. The class is available in 2D and 3D, and it
+currently only supports periodic boundary conditions. The domain must have
+at least 2 cells in each direction. The first :cpp:`AMREX_SPACEDIM`
+components of the :cpp:`MultiFab` are the velocity. If the output has ghost
+cells, one layer of them is filled. Below is an example of using
+it.
+
+.. highlight:: c++
+
+::
+
+    Geometry geom(...);   // periodic in all directions
+    MultiFab vel(...);    // cell-centered, AMREX_SPACEDIM components
+    MultiFab vel_proj(...);
+
+    FFT::CrossProj proj(geom);
+    proj.solve(vel_proj, vel); // vel_proj and vel can be the same MultiFab
+
+Similar to the other FFT classes, the object should be cached for reuse.
+In 2D, a multigrid solver with the same interface, :cpp:`GMG::CrossProj`,
+is described in section :ref:`sec:linearsolver:crossproj`.
+
+.. _sec:FFT:rawptr:
+
+Raw Pointer Interface
+=====================
+
+If you only want to use AMReX as a parallel FFT library without using other
+functionality or data containers, you could use the raw pointer
+interface. Below is an example.
+
+.. highlight:: c++
+
+::
+
+    MPI_Init(&argc, &argv);
+
+    // We don't need to call the full amrex::Initialize
+    amrex::Init_FFT(MPI_COMM_WORLD);
+
+    int nprocs, myproc;
+    MPI_Comm_size(MPI_COMM_WORLD, &nprocs);
+    MPI_Comm_rank(MPI_COMM_WORLD, &myproc);
+
+    using RT = double;
+    using CT = std::complex<RT>; // or cufftDoubleComplex, etc.
+
+    std::array<int,3> domain_size{128,128,128};
+
+    // FFT between real and complex.
+    // Domain decomposition is flexible. The only constraint for the raw
+    // pointer interface is that there can be only zero or one local box
+    // per process, whereas the MultiFab interface can take any number of
+    // boxes. In this case, we choose to do manual domain decomposition for
+    // the real (i.e., forward) domain, and use the domain decomposition
+    // provided by amrex for the complex (i.e., backward) domain.
+    {
+        amrex::FFT::R2C<RT,amrex::FFT::Direction::both> r2c(domain_size);
+
+        // amrex supports 1d, 2d and 3d domain decomposition. For simplicity,
+        // let's do 1d decomposition in the z-direction.
+        int nz = (domain_size[2] + nprocs - 1) / nprocs;
+        int zlo = nz * myproc;
+        nz = std::max(std::min(nz,domain_size[2]-zlo), 0);
+        std::array<int,3> local_start{0,0,zlo};
+        std::array<int,3> local_size{domain_size[0],domain_size[1],nz};
+
+        // Let amrex know the domain decomposition in the forward domain.
+        r2c.setLocalDomain(local_start,local_size);
+
+        // Use amrex's domain decomposition in the backward domain.
+        auto const& [local_start_sp, local_size_sp] = r2c.getLocalSpectralDomain();
+
+        auto nr = std::size_t(local_size[0])
+                * std::size_t(local_size[1])
+                * std::size_t(local_size[2]);
+        auto* pr = (RT*)std::malloc(sizeof(RT)*nr); // or use cudaMalloc
+        // Initialize data ...
+
+        auto nc = std::size_t(local_size_sp[0])
+                * std::size_t(local_size_sp[1])
+                * std::size_t(local_size_sp[2]);
+        auto* pc = (CT*)std::malloc(sizeof(CT)*nc); // or use cudaMalloc
+
+        r2c.forward(pr, pc); // forward transform from real to complex
+
+        // work on the complex data pointed by pc ...
+
+        r2c.backward(pc, pr); // backward transform from complex to real
+
+        std::free(pr);
+        std::free(pc);
+    }
+
+    // Batched FFT between complex and complex.
+    // In this case, we choose to use the domain decomposition provided
+    // by amrex for the forward domain, and do manual domain decomposition
+    // for the backward domain.
+    int nbatch = 3; // batch size
+    {
+        amrex::FFT::Info info{};
+        info.setBatchSize(nbatch);
+        amrex::FFT::C2C<RT,amrex::FFT::Direction::both> c2c(domain_size,info);
+
+        // Use amrex's domain decomposition in the forward domain.
+        auto const& [local_start, local_size] = c2c.getLocalDomain();
+
+        int nx = (domain_size[0] + nprocs - 1) / nprocs;
+        int xlo = nx * myproc;
+        nx = std::max(std::min(nx,domain_size[0]-xlo), 0);
+        std::array<int,3> local_start_sp{xlo,0,0};
+        std::array<int,3> local_size_sp{nx,domain_size[1],domain_size[2]};
+
+        // Let amrex know the domain decomposition in the backward domain.
+        c2c.setLocalSpectralDomain(local_start_sp, local_size_sp);
+
+        auto nf = std::size_t(local_size[0])
+                * std::size_t(local_size[1])
+                * std::size_t(local_size[2]);
+        auto* pf = (CT*)std::malloc(sizeof(CT)*nf*nbatch); // or use cudaMalloc
+        // Initialize data ...
+
+        auto nb = std::size_t(local_size_sp[0])
+                * std::size_t(local_size_sp[1])
+                * std::size_t(local_size_sp[2]);
+        auto* pb = (CT*)std::malloc(sizeof(CT)*nb*nbatch);
+
+        c2c.forward(pf, pb); // forward transform
+
+        // work on the data pointed by pb
+
+        c2c.backward(pb, pf); // backward transform
+
+        std::free(pf);
+        std::free(pb);
+    }
+
+    amrex::Finalize_FFT();
+
+    MPI_Finalize();

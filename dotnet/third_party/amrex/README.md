@@ -1,0 +1,219 @@
+<div align="center">
+<img src="https://github.com/amrex-codes/amrex-codes.github.io/blob/main/images/AMReX-horizontal-color.png" alt="AMReX Logo">
+
+<p align="center">
+  <a href="https://doi.org/10.21105/joss.01370">
+  <img src="http://joss.theoj.org/papers/10.21105/joss.01370/status.svg" alt="Citing">
+  </a>
+  <a href="https://doi.org/10.5281/zenodo.2555438">
+  <img src="https://zenodo.org/badge/DOI/10.5281/zenodo.2555438.svg" alt="DOI">
+  </a>
+  <a href="https://scan.coverity.com/projects/amrex-codes-amrex">
+  <img alt="Coverity Scan Build Status" src="https://scan.coverity.com/projects/28563/badge.svg">
+  </a>
+  <a href="https://www.bestpractices.dev/projects/11299">
+  <img alt="OpenSSF Best Practices Status" src="https://www.bestpractices.dev/projects/11299/badge">
+  </a>
+  <a href="https://scorecard.dev/viewer/?uri=github.com/AMReX-Codes/amrex">
+  <img alt="OpenSSF Scorecard" src="https://api.scorecard.dev/projects/github.com/AMReX-Codes/amrex/badge">
+  </a>
+  <a href="https://opensource.org/licenses/BSD-3-Clause">
+  <img alt="License" src="https://img.shields.io/badge/License-BSD_3--Clause-blue.svg">
+  </a>
+</p>
+
+<p>
+A software framework for massively parallel block-structured adaptive mesh
+refinement applications.
+</p>
+
+[Overview](#Overview) -
+[Features](#Features) -
+[Installation](#Installation) -
+[Usage](#Usage) -
+[Examples](#Examples) -
+[Documentation](#Documentation) -
+[Gallery](#Gallery) -
+[Get Help](#get-help) -
+[Contribute](#Contribute) -
+[Governance](#Governance) -
+[Copyright Notice](#copyright-notice) -
+[License](#License) -
+[Citation](#Citation)
+
+<a href="https://hpsf.io/">
+<img src="https://github.com/amrex-codes/amrex-codes.github.io/blob/main/images/HPSF_Project_Badge_Established.png" alt="HPSF Badge" style="width:96px;height:96px;">
+</a>
+
+</div>
+
+## Overview
+
+AMReX is a software framework designed to accelerate scientific discovery for
+applications solving partial differential equations on block-structured meshes. Its
+massively parallel adaptive mesh refinement (AMR) algorithms focus computational
+resources and allow scalable performance on heterogeneous architectures so that
+scientists can efficiently resolve details in large simulations.
+
+More information is available at the [AMReX website](https://amrex-codes.github.io/).
+
+## Features
+
+- C++ and Fortran interfaces
+- Support for cell-centered, face-centered, edge-centered, and nodal data
+- Support for hyperbolic, parabolic, and elliptic solves on a hierarchical adaptive grid structure
+- Optional subcycling in time for time-dependent PDEs
+- Support for particles
+- Embedded boundary description of irregular geometry
+- Parallelization via flat MPI, OpenMP, hybrid MPI/OpenMP, or MPI/MPI
+- GPU Acceleration with CUDA (NVidia), HIP (AMD) or SYCL (Intel) backends
+- Parallel I/O
+- Plotfile format supported by Amrvis, VisIt, ParaView and yt
+- Built-in profiling tools
+
+## Installation
+
+AMReX runs on Linux, macOS and Windows, and is deployed on DOE HPC systems
+including Perlmutter, Frontier and Aurora. Building it requires a C++20
+compiler and CMake 3.25 or newer. MPI is enabled by default and can be turned
+off with `-DAMReX_MPI=OFF`; OpenMP and a GPU toolchain (CUDA, HIP or SYCL) are
+optional.
+
+```bash
+git clone https://github.com/AMReX-Codes/amrex.git
+cd amrex
+cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/path/to/installdir
+cmake --build build -j8 --target install
+```
+
+Build options are set with `-D<var>=<value>`, for example `-DAMReX_MPI=OFF`,
+`-DAMReX_SPACEDIM=2` or `-DAMReX_GPU_BACKEND=CUDA`. AMReX can also be built
+with GNU Make, and is packaged for Spack. See the
+[Building AMReX](https://amrex-codes.github.io/amrex/docs_html/BuildingAMReX.html)
+chapter of the User's Guide for the full set of options and for the GNU Make
+workflow.
+
+## Usage
+
+The quickest way to start is to build one of the
+[tutorials](https://amrex-codes.github.io/amrex/tutorials_html/),
+which introduce `MultiFab` data, parallel iteration and the AMR hierarchy one
+step at a time. To use an installed AMReX from your own CMake project:
+
+```cmake
+find_package(AMReX REQUIRED)
+target_link_libraries(my_app PUBLIC AMReX::amrex)
+```
+
+## Examples
+
+Runnable tutorial codes covering basic usage, AMR, linear solvers, particles,
+embedded boundaries, FFT and time integration, on CPUs and GPUs, live in the
+[amrex-tutorials](https://github.com/AMReX-Codes/amrex-tutorials) repository and
+are documented at
+[AMReX Tutorials](https://amrex-codes.github.io/amrex/tutorials_html/).
+
+## Documentation
+
+Four types of documentation are available:
+- [User's Guide](https://amrex-codes.github.io/amrex/docs_html/) -- For more information about AMReX features and functions
+- [Tutorials](https://amrex-codes.github.io/amrex/tutorials_html/) -- Small stand-alone codes, from introductory examples to complete applications to start your own project from
+- [Technical Reference](https://amrex-codes.github.io/amrex/doxygen/) -- Conveniently searchable code documentation via Doxygen
+- [Slides](https://drive.google.com/file/d/1-Fn6peoPj6zRc-iV-j1_Zc3YHoKZM2C9/view?usp=sharing) and [video recordings](https://youtube.com/playlist?list=PL20S5EeApOSs7JV6dMJnpduaznAoR2Cpr&feature=shared) -- From the [AMReX tutorial](https://www.nersc.gov/performance-portability-series-amrex-mar2024/) organized by NERSC/OLCF/ALCF on March 14, 2024
+
+## Gallery
+
+AMReX supports several Exascale Computing Project software applications, such as
+ExaSky, WarpX, Pele(Combustion), Astro, and MFiX-Exa. AMReX has also been used
+in a wide variety of other scientific simulations, some of which, can be seen
+in our application [gallery](https://amrex-codes.github.io/amrex/gallery.html).
+
+<div align="center">
+<img src="https://github.com/amrex-codes/amrex-codes.github.io/blob/main/images/gallery_small.gif" alt="Gallery Slideshow">
+</div>
+
+## Get Help
+
+You can also view questions
+and ask your own on our [GitHub Discussions](https://github.com/AMReX-Codes/amrex/discussions) page.
+To obtain additional help, simply post an issue.
+
+## Contribute
+
+We are always happy to have users contribute to the AMReX source code. To
+contribute, issue a pull request against the development branch.
+Any level of changes are welcomed: documentation, bug fixes, new test problems,
+new solvers, etc. For more details on how to contribute to AMReX, please see
+[CONTRIBUTING.md](CONTRIBUTING.md).
+
+If you're using AMReX in your own GitHub projects, consider adding `amrex`
+as a [repository topic](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/classifying-your-repository-with-topics)!
+This helps others discover related work and strengthens the AMReX ecosystem.
+
+## Governance
+
+AMReX is led in an open governance model. The steering committee, the technical
+committee, and the contributor roles, along with their decision and appointment
+processes, are described in [GOVERNANCE.md](GOVERNANCE.md).
+
+## Copyright Notice
+
+AMReX Copyright (c) 2024, The Regents of the University of California,
+through Lawrence Berkeley National Laboratory (subject to receipt of any
+required approvals from the U.S. Dept. of Energy).  All rights reserved.
+
+If you have questions about your rights to use or distribute this software,
+please contact Berkeley Lab's Intellectual Property Office at IPO@lbl.gov.
+
+Please see the notices in [NOTICE](NOTICE).
+
+## License
+
+License for AMReX can be found at [LICENSE](LICENSE).
+
+## Citation
+
+To cite AMReX, please use [![Citing](http://joss.theoj.org/papers/10.21105/joss.01370/status.svg)](https://doi.org/10.21105/joss.01370)
+and [the first IJHPCA paper](https://journals.sagepub.com/doi/full/10.1177/10943420211022811).
+
+```
+@article{AMReX_JOSS,
+  doi = {10.21105/joss.01370},
+  url = {https://doi.org/10.21105/joss.01370},
+  year = {2019},
+  month = may,
+  publisher = {The Open Journal},
+  volume = {4},
+  number = {37},
+  pages = {1370},
+  author = {Weiqun Zhang and Ann Almgren and Vince Beckner and John Bell and Johannes Blaschke and Cy Chan and Marcus Day and Brian Friesen and Kevin Gott and Daniel Graves and Max Katz and Andrew Myers and Tan Nguyen and Andrew Nonaka and Michele Rosso and Samuel Williams and Michael Zingale},
+  title = {{AMReX}: a framework for block-structured adaptive mesh refinement},
+  journal = {Journal of Open Source Software}
+}
+
+@article{AMReX_IJHPCA1,
+     author = {Zhang, W. and Myers, A. and Gott, K. and Almgren, A. and Bell, J.},
+     title = {{AMReX}: {B}lock-structured adaptive mesh refinement for multiphysics applications},
+     journal = {The International Journal of High Performance Computing Applications},
+     year = {2021},
+     volume = {35},
+     number = {6},
+     pages = {508-526},
+     doi = {10.1177/10943420211022811}
+}
+```
+
+If you have also used pyAMReX and/or you use more modern features of AMReX, please also cite
+[the second IJHPCA paper](https://journals.sagepub.com/doi/full/10.1177/10943420241271017).
+
+```
+@article{AMReX_IJHPCA2,
+     author = {Andrew Myers and Weiqun Zhang and Ann Almgren and Thierry Antoun and John Bell and Axel Huebl and Alexander Sinn},
+     title = {{AMReX} and {pyAMReX}: Looking Beyond the Exascale Computing Project},
+     journal = {The International Journal of High Performance Computing Applications},
+     year = {2024},
+     volume = {38},
+     number = {6},
+     doi = {10.1177/10943420241271017}
+}
+```

@@ -1,0 +1,334 @@
+// Copyright Contributors to the OpenVDB Project
+// SPDX-License-Identifier: Apache-2.0
+//
+#include <fvdb/BuilderResource.h>
+#include <fvdb/GridBatchData.h>
+#include <fvdb/GridStorage.h>
+#include <fvdb/detail/GridBatchDataFactory.h>
+#include <fvdb/detail/ops/BuildDenseGrid.h>
+#include <fvdb/detail/utils/AccessorHelpers.cuh>
+#include <fvdb/detail/utils/Utils.h>
+#include <fvdb/detail/utils/cuda/GridDim.h>
+#include <fvdb/detail/utils/cuda/StreamOrdering.h>
+#include <fvdb/detail/utils/cuda/Utils.cuh>
+#include <fvdb/detail/utils/nanovdb/BuildDistributedGrid.cuh>
+#include <fvdb/detail/utils/nanovdb/DeviceGridHandleUtils.cuh>
+
+#if !CCCL_DEVICE_MERGE_SUPPORTED
+#include <nanovdb/tools/cuda/PointsToGrid.cuh>
+#endif
+#include <nanovdb/HostBuffer.h>
+
+#include <c10/cuda/CUDACachingAllocator.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAMathCompat.h>
+#include <torch/types.h>
+
+#include <limits>
+
+namespace fvdb {
+namespace detail {
+namespace ops {
+
+namespace {
+
+__global__ __launch_bounds__(DEFAULT_BLOCK_DIM) void
+ijkForDense(uint64_t offset,
+            nanovdb::Coord ijkMin,
+            nanovdb::Coord size,
+            TorchRAcc64<int32_t, 2> outIJKAccessor) {
+    const uint64_t tid = (static_cast<uint64_t>(blockIdx.x) * blockDim.x) + threadIdx.x + offset;
+
+    if (tid >= outIJKAccessor.size(0)) {
+        return;
+    }
+
+    // tid = x * size[1] * size[2] + y * size[2] + z
+    const int64_t xi = tid / (size[1] * size[2]);
+    const int64_t yi = tid % (size[1] * size[2]) / size[2];
+    const int64_t zi = tid % size[2];
+
+    outIJKAccessor[tid][0] = xi + ijkMin[0];
+    outIJKAccessor[tid][1] = yi + ijkMin[1];
+    outIJKAccessor[tid][2] = zi + ijkMin[2];
+}
+
+void
+checkInputs(const torch::Device device,
+            const uint32_t batchSize,
+            const nanovdb::Coord &size,
+            const nanovdb::Coord &ijkMin,
+            const std::optional<torch::Tensor> &mask) {
+    TORCH_CHECK(size[0] > 0 && size[1] > 0 && size[2] > 0,
+                "Size must be greater than 0 in all dimensions");
+    TORCH_CHECK((__uint128_t)size[0] * size[1] * size[2] <= std::numeric_limits<int64_t>::max(),
+                "Size of dense grid exceeds the number of voxels supported by a GridBatch");
+    TORCH_CHECK((__uint128_t)size[0] * size[1] * size[2] * batchSize <=
+                    std::numeric_limits<int64_t>::max(),
+                "Size and batch size exceed the number of voxels supported by a GridBatch");
+    // The unmasked path materializes every cell as a coordinate and feeds it to NanoVDB's
+    // PointsToGrid, whose radix sort casts the count to int32 (PointsToGrid.cuh:645) and silently
+    // corrupts the grid above 2^31 cells (~1291^3). The masked path builds only the selected
+    // subset, so it is exempt here.
+    TORCH_CHECK(mask.has_value() || (__uint128_t)size[0] * size[1] * size[2] <=
+                                        (__uint128_t)std::numeric_limits<int32_t>::max(),
+                "Unmasked dense grid volume exceeds the 2^31-coordinate limit of the NanoVDB grid "
+                "builder. Provide a sparse mask or reduce the dense dimensions.");
+    if (mask.has_value()) {
+        TORCH_CHECK(mask.value().device() == device,
+                    "Mask device must match device of dense grid to build");
+        TORCH_CHECK(mask.value().dtype() == torch::kBool, "Mask must be of type bool");
+        TORCH_CHECK(mask.value().dim() == 3, "Mask must be 3D");
+        TORCH_CHECK(mask.value().size(0) == size[0] && mask.value().size(1) == size[1] &&
+                        mask.value().size(2) == size[2],
+                    "Mask must have same size as dense grid to build");
+    }
+}
+
+} // namespace
+
+template <torch::DeviceType>
+GridStorage dispatchCreateNanoGridFromDense(int64_t batchSize,
+                                            nanovdb::Coord ijkMin,
+                                            nanovdb::Coord size,
+                                            torch::Device device,
+                                            const std::optional<torch::Tensor> &mask);
+
+template <>
+GridStorage
+dispatchCreateNanoGridFromDense<torch::kCUDA>(int64_t batchSize,
+                                              nanovdb::Coord ijkMin,
+                                              nanovdb::Coord size,
+                                              torch::Device device,
+                                              const std::optional<torch::Tensor> &mask) {
+    using GridT = nanovdb::ValueOnIndex;
+    TORCH_CHECK(device.is_cuda(), "device must be cuda");
+    TORCH_CHECK(device.has_index(), "device must have index");
+    checkInputs(device, batchSize, size, ijkMin, mask);
+
+    c10::cuda::CUDAGuard deviceGuard(device);
+    // The grids are built and their storage retained on the device's current torch stream; the
+    // prototype carries that stream and the device into every allocation the builder makes.
+    const cudaStream_t stream    = storageStream(device);
+    const DeviceGridBuffer proto = GridStorage::deviceProto(device, stream);
+
+    if (batchSize == 0) {
+        // Same result as merging zero parts: an empty storage, which makeGridBatchData rejects.
+        return GridStorageParts(device, stream, 0).merge();
+    }
+
+    const int64_t gridVolume = static_cast<int64_t>(size[0]) * size[1] * size[2];
+
+    const int64_t NUM_BLOCKS = GET_BLOCKS(gridVolume, DEFAULT_BLOCK_DIM);
+
+    const torch::TensorOptions opts = torch::TensorOptions().dtype(torch::kInt32).device(device);
+    torch::Tensor ijkData           = torch::empty({gridVolume, 3}, opts);
+
+    if (NUM_BLOCKS > 0) {
+        ijkForDense<<<NUM_BLOCKS, DEFAULT_BLOCK_DIM, 0, stream>>>(
+            0u, ijkMin, size, ijkData.packed_accessor64<int32_t, 2, torch::RestrictPtrTraits>());
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+
+    if (mask.has_value()) {
+        torch::Tensor maskValue = mask.value().view({-1});
+        TORCH_CHECK(maskValue.device() == device, "mask must be on same device as ijkData");
+        ijkData = ijkData.index({maskValue});
+    }
+
+    TORCH_CHECK(ijkData.is_contiguous(), "ijkData must be contiguous");
+
+    // Every batch item is the same dense box (a mask, if given, is shared across the batch), so
+    // build the grid once and repeat it. The merge replicates the one grid into every slot.
+    const int64_t nVoxels = ijkData.size(0);
+    GridStorageParts parts(device, stream, 1);
+    if (nVoxels == 0) {
+        parts.addEmpty();
+    } else {
+        parts.add(GridStorage(
+            nanovdb::tools::cuda::
+                voxelsToGrid<GridT, nanovdb::Coord *, DeviceGridBuffer, BuilderResource>(
+                    static_cast<nanovdb::Coord *>(ijkData.data_ptr()), nVoxels, 1.0, proto, stream),
+            device));
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+    for (int64_t i = 1; i < batchSize; ++i) {
+        parts.addRepeat(0);
+    }
+    return parts.merge();
+}
+
+template <>
+GridStorage
+dispatchCreateNanoGridFromDense<torch::kPrivateUse1>(int64_t batchSize,
+                                                     nanovdb::Coord ijkMin,
+                                                     nanovdb::Coord size,
+                                                     torch::Device device,
+                                                     const std::optional<torch::Tensor> &mask) {
+    using GridT = nanovdb::ValueOnIndex;
+
+#if CCCL_DEVICE_MERGE_SUPPORTED
+    TORCH_CHECK(device.is_privateuseone(), "device must be privateuseone");
+    checkInputs(device, batchSize, size, ijkMin, mask);
+
+    const int64_t volume = static_cast<int64_t>(size[0]) * static_cast<int64_t>(size[1]) *
+                           static_cast<int64_t>(size[2]);
+    const torch::TensorOptions opts = torch::TensorOptions().dtype(torch::kInt32).device(device);
+    torch::Tensor ijkData           = torch::empty({volume, 3}, opts);
+
+    for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
+        C10_CUDA_CHECK(cudaSetDevice(deviceId));
+        cudaStream_t stream = c10::cuda::getCurrentCUDAStream(deviceId).stream();
+
+        size_t deviceOffset, deviceVolume;
+        std::tie(deviceOffset, deviceVolume) = deviceChunk(volume, deviceId);
+
+        constexpr int64_t kNumThreads = DEFAULT_BLOCK_DIM;
+        const int64_t deviceNumBlocks = GET_BLOCKS(deviceVolume, kNumThreads);
+        if (deviceNumBlocks > 0) {
+            ijkForDense<<<deviceNumBlocks, kNumThreads, 0, stream>>>(
+                deviceOffset,
+                ijkMin,
+                size,
+                ijkData.packed_accessor64<int32_t, 2, torch::RestrictPtrTraits>());
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+        }
+    }
+
+    // The coordinates were written on each device's current stream; the mesh streams the builder
+    // runs on are not ordered after them.
+    for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
+        c10::cuda::getCurrentCUDAStream(deviceId).synchronize();
+    }
+
+    if (mask.has_value()) {
+        torch::Tensor maskValue = mask.value().view({-1});
+        TORCH_CHECK(maskValue.device() == device, "mask must be on same device as ijkData");
+        ijkData = ijkData.index({maskValue});
+    }
+
+    TORCH_CHECK(ijkData.is_contiguous(), "ijkData must be contiguous");
+
+    // The built parts are unified storage, which retains no stream. Merging several items runs
+    // on storageStream(PrivateUse1), the legacy default stream, and synchronizes it.
+    const cudaStream_t stream = storageStream(device);
+
+    // Every batch item is the same dense box, so build the grid once and copy it for the remaining
+    // items instead of re-running DistributedPointsToGrid over the identical coordinate list: the
+    // merge copies the one grid into each item's slot.
+    const int64_t nVoxels = ijkData.size(0);
+    GridStorageParts parts(device, stream, 1);
+    for (int64_t i = 0; i < batchSize; i++) {
+        if (!nVoxels) {
+            parts.addEmpty();
+        } else if (i == 0) {
+            auto *coordPtr = static_cast<nanovdb::Coord *>(ijkData.data_ptr());
+
+            parts.add(GridStorage(buildDistributedGrid<GridT>(coordPtr, nVoxels), device));
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+        } else {
+            parts.addRepeat(0);
+        }
+    }
+
+    // A single item is handed out as built (buildDistributedGrid synchronized it); the assembler
+    // synchronizes for a PrivateUse1 destination itself.
+    return parts.merge();
+#else
+    TORCH_CHECK(false, "Distributed creation of grids requires CUDA 12.8 or later");
+    return GridStorage();
+#endif
+}
+
+template <>
+GridStorage
+dispatchCreateNanoGridFromDense<torch::kCPU>(int64_t batchSize,
+                                             nanovdb::Coord ijkMin,
+                                             nanovdb::Coord size,
+                                             torch::Device device,
+                                             const std::optional<torch::Tensor> &mask) {
+    using GridT = nanovdb::ValueOnIndex;
+    checkInputs(device, batchSize, size, ijkMin, mask);
+
+    torch::TensorAccessor<bool, 3> maskAccessor(nullptr, nullptr, nullptr);
+    if (mask.has_value()) {
+        maskAccessor = mask.value().accessor<bool, 3>();
+    }
+
+    using ProxyGridT       = nanovdb::tools::build::Grid<float>;
+    auto proxyGrid         = std::make_shared<ProxyGridT>(0.0f);
+    auto proxyGridAccessor = proxyGrid->getWriteAccessor();
+
+    for (int32_t i = 0; i < size[0]; i += 1) {
+        for (int32_t j = 0; j < size[1]; j += 1) {
+            for (int32_t k = 0; k < size[2]; k += 1) {
+                const nanovdb::Coord ijk = ijkMin + nanovdb::Coord(i, j, k);
+                if (mask.has_value()) {
+                    if (maskAccessor[i][j][k] == false) {
+                        continue;
+                    } else {
+                        proxyGridAccessor.setValue(ijk, 1.0f);
+                    }
+                } else {
+                    proxyGridAccessor.setValue(ijk, 1.0f);
+                }
+            }
+        }
+    }
+
+    proxyGridAccessor.merge();
+    nanovdb::GridHandle<nanovdb::HostBuffer> ret =
+        nanovdb::tools::createNanoGrid<ProxyGridT, GridT, nanovdb::HostBuffer>(
+            *proxyGrid, 0u, false, false);
+
+    // Every batch item is the same dense box, so copy the one grid for the remaining items.
+    std::vector<nanovdb::GridHandle<nanovdb::HostBuffer>> batchHandles;
+    batchHandles.reserve(batchSize);
+    batchHandles.push_back(std::move(ret));
+    for (uint32_t i = 1; i < batchSize; i += 1) {
+        batchHandles.push_back(batchHandles[0].copy());
+    }
+
+    return GridStorage(batchHandles.size() == 1 ? std::move(batchHandles[0])
+                                                : nanovdb::mergeGrids(batchHandles));
+}
+
+c10::intrusive_ptr<GridBatchData>
+createNanoGridFromDense(int64_t batchSize,
+                        nanovdb::Coord ijkMin,
+                        nanovdb::Coord size,
+                        torch::Device device,
+                        const std::optional<torch::Tensor> &maybeMask,
+                        const std::vector<nanovdb::Vec3d> &voxelSizes,
+                        const std::vector<nanovdb::Vec3d> &origins) {
+    TORCH_CHECK_VALUE(batchSize >= 0, "numGrids must be non-negative");
+    if (maybeMask.has_value()) {
+        TORCH_CHECK_VALUE(maybeMask.value().dtype() == torch::kBool,
+                          "mask must be a boolean type or None");
+        TORCH_CHECK_VALUE(maybeMask.value().dim() == 3, "mask must be 3 dimensional");
+        TORCH_CHECK_VALUE(maybeMask.value().size(0) == size[0],
+                          "mask must have shape (w, h, d) = denseDims");
+        TORCH_CHECK_VALUE(maybeMask.value().size(1) == size[1],
+                          "mask must have shape (w, h, d) = denseDims");
+        TORCH_CHECK_VALUE(maybeMask.value().size(2) == size[2],
+                          "mask must have shape (w, h, d) = denseDims");
+    }
+    TORCH_CHECK_VALUE(size[0] >= 0 && size[1] >= 0 && size[2] >= 0,
+                      "denseDims must be non-negative");
+    TORCH_CHECK_VALUE(batchSize <= GridBatchData::MAX_GRIDS_PER_BATCH,
+                      "Cannot create a grid with more than ",
+                      GridBatchData::MAX_GRIDS_PER_BATCH,
+                      " grids in a batch. ",
+                      "You requested ",
+                      batchSize,
+                      " grids.");
+    GridStorage storage = FVDB_DISPATCH_KERNEL(device, [&]() {
+        return dispatchCreateNanoGridFromDense<DeviceTag>(
+            batchSize, ijkMin, size, device, maybeMask);
+    });
+    return makeGridBatchData(std::move(storage), voxelSizes, origins);
+}
+
+} // namespace ops
+} // namespace detail
+} // namespace fvdb

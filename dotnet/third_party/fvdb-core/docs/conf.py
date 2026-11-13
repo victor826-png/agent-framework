@@ -1,0 +1,206 @@
+# Copyright Contributors to the OpenVDB Project
+# SPDX-License-Identifier: Apache-2.0
+#
+# -- Path setup --------------------------------------------------------------
+
+# If extensions (or modules to document with autodoc) are in another directory,
+# add these directories to sys.path here. If the directory is relative to the
+# documentation root, use os.path.abspath to make it absolute, like shown here.
+
+import json
+import os
+import re
+import sys
+
+sys.path.insert(0, os.path.abspath(".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "_ext"))
+
+_versions_path = os.path.join(os.path.dirname(__file__), "..", ".github", "versions.json")
+try:
+    with open(_versions_path) as _f:
+        _versions = json.load(_f)
+except FileNotFoundError:
+    _versions = {
+        "torch": {"full_version": "unknown", "version": "0"},
+        "cuda": {"versions": {}},
+        "python": {"matrix": ["3.12"]},
+    }
+
+_torch_full = _versions["torch"]["full_version"]
+_torch_short = _versions["torch"]["version"].replace(".", "")
+_cuda_versions = list(_versions["cuda"]["versions"].keys())
+_python_matrix = _versions["python"]["matrix"]
+
+# Derive the nightly base version from pyproject.toml. This must mirror the
+# BASE_VERSION computation in .github/workflows/nightly-publish.yml so that the
+# install examples below match the actual versions of the published wheels.
+_pyproject_path = os.path.join(os.path.dirname(__file__), "..", "pyproject.toml")
+try:
+    with open(_pyproject_path) as _f:
+        _pyproject_text = _f.read()
+    _version_match = re.search(r'^version\s*=\s*"([^"]+)"', _pyproject_text, re.MULTILINE)
+    _raw_pyproject_version = _version_match.group(1) if _version_match else "0.0.0"
+except FileNotFoundError:
+    _raw_pyproject_version = "0.0.0"
+
+_fvdb_core_nightly_base = (
+    re.sub(r"(\.dev\d+|\.post\d+|(a|b|c|rc)\d+)+$", "", _raw_pyproject_version.split("+", 1)[0]) or "0.0.0"
+)
+
+
+# -- Project information -----------------------------------------------------
+
+project = "ƒVDB"
+copyright = "Contributors to the OpenVDB Project"
+author = "Contributors to the OpenVDB Project"
+
+# -- Stable release metadata ---------------------------------------------------
+# The values below describe the most recent fvdb-core release and drive the
+# "Installation from pre-built wheels" examples. They intentionally lag the
+# in-development versions in .github/versions.json (which drive the nightly
+# install examples) while main targets the next release.
+# Updated automatically by devtools/update-doc-versions.sh when a release is
+# published (see .github/workflows/sync-doc-version.yml).
+fvdb_core_stable_version = "0.6.0"
+fvdb_core_stable_torch_version = "2.13.0"
+fvdb_core_stable_cuda_versions = ["13.0", "13.2"]
+fvdb_core_stable_python_range = "3.10 - 3.15"
+
+version = fvdb_core_stable_version
+release = fvdb_core_stable_version
+
+_stable_torch_short = "".join(fvdb_core_stable_torch_version.split(".")[:2])
+
+_subs = []
+# Substitutions for the stable (released) install examples.
+_subs.append(f".. |fvdb_core_stable_version| replace:: {fvdb_core_stable_version}")
+_subs.append(f".. |stable_torch_full_version| replace:: {fvdb_core_stable_torch_version}")
+_subs.append(f".. |stable_python_range| replace:: {fvdb_core_stable_python_range}")
+_subs.append(f".. |stable_cuda_versions| replace:: {', '.join(fvdb_core_stable_cuda_versions)}")
+for _cv in fvdb_core_stable_cuda_versions:
+    _tag = f"cu{_cv.replace('.', '')}"
+    _subs.append(f".. |stable_{_tag}_ver| replace:: {_cv}")
+    _subs.append(
+        f".. |fvdb_core_stable_version_{_tag}| replace:: {fvdb_core_stable_version}+pt{_stable_torch_short}.{_tag}"
+    )
+# Substitutions for the in-development (nightly) install examples, sourced
+# from .github/versions.json on this branch.
+_subs.append(f".. |torch_full_version| replace:: {_torch_full}")
+_subs.append(f".. |torch_short| replace:: {_torch_short}")
+_subs.append(f".. |fvdb_core_nightly_base| replace:: {_fvdb_core_nightly_base}")
+_subs.append(f".. |python_range| replace:: {_python_matrix[0]} - {_python_matrix[-1]}")
+_subs.append(f".. |cuda_versions| replace:: {', '.join(_cuda_versions)}")
+for _cv in _cuda_versions:
+    _tag = f"cu{_cv.replace('.', '')}"
+    _subs.append(f".. |{_tag}_ver| replace:: {_cv}")
+    _subs.append(f".. |{_tag}_tag| replace:: {_tag}")
+rst_prolog = "\n".join(_subs) + "\n"
+
+
+# -- General configuration ---------------------------------------------------
+
+# Add any Sphinx extension module names here, as strings. They can be
+# extensions coming with Sphinx (named 'sphinx.ext.*') or your custom
+# ones.
+extensions = [
+    "sphinx.ext.autodoc",
+    "sphinx.ext.viewcode",
+    "sphinx.ext.napoleon",
+    "sphinx.ext.coverage",
+    "public_api_coverage",
+    "myst_parser",
+]
+
+myst_enable_extensions = [
+    "amsmath",
+    "attrs_inline",
+    "colon_fence",
+    "deflist",
+    "dollarmath",
+    "fieldlist",
+    "html_admonition",
+    "html_image",
+    "linkify",
+    "replacements",
+    "smartquotes",
+    "strikethrough",
+    "substitution",
+    "tasklist",
+]
+
+myst_heading_anchors = 3
+
+# Fix return-type in google-style docstrings
+napoleon_custom_sections = [("Returns", "params_style")]
+
+# Add any paths that contain templates here, relative to this directory.
+templates_path = ["_templates"]
+
+source_suffix = [".rst", ".md"]
+
+# List of patterns, relative to source directory, that match files and
+# directories to ignore when looking for source files.
+# This pattern also affects html_static_path and html_extra_path.
+exclude_patterns = ["_build", "Thumbs.db", ".DS_Store", "wip", "TEACHME"]
+
+autodoc_default_options = {"undoc-members": "forward, extra_repr"}
+
+# Mock the compiled C++ extension so Sphinx can introspect the Python API
+# on build hosts that lack CUDA (e.g. Read the Docs).
+autodoc_mock_imports = ["_fvdb_cpp", "fvdb._fvdb_cpp"]
+
+# Public aliases must be counted even when implemented in private modules.
+# The extension retains Sphinx's python.txt report and also writes coverage.json.
+coverage_public_modules = ["fvdb", "fvdb.functional", "fvdb.nn", "fvdb.viz", "fvdb.utils", "fvdb.utils.metrics"]
+coverage_min_percentage = 100.0
+coverage_show_missing_items = True
+coverage_statistics_to_stdout = True
+coverage_skip_undoc_in_source = False
+coverage_ignore_pyobjects = [
+    r"^fvdb\.config$",  # Native runtime configuration; no Python API reference contract yet.
+    r"^fvdb\.nn\.[^.]+\.extra_repr$",  # PyTorch's representation hook, not an operation.
+]
+
+# -- Options for HTML output -------------------------------------------------
+
+# The theme to use for HTML and HTML Help pages.  See the documentation for
+# a list of builtin themes.
+#
+html_theme = "sphinx_rtd_theme"
+html_theme_options = {"analytics_id": "G-60P7VJJ09C"}  # Google Analytics ID
+
+html_context = {
+    "display_github": True,
+    "github_user": "openvdb",
+    "github_repo": "fvdb-core",
+    "github_version": "main",
+    "conf_py_path": "/docs/",
+}
+
+# Add any paths that contain custom static files (such as style sheets) here,
+# relative to this directory. They are copied after the builtin static files,
+# so a file named "default.css" will overwrite the builtin "default.css".
+html_static_path = ["imgs"]
+html_css_files = [
+    "css/custom.css",
+]
+
+
+# -- Custom hooks ------------------------------------------------------------
+
+
+def process_signature(app, what, name, obj, options, signature, return_annotation):
+    if signature is not None:
+        signature = signature.replace("._fvdb_cpp", "")
+        signature = signature.replace("fvdb::", "fvdb.")
+
+    if return_annotation is not None:
+        return_annotation = return_annotation.replace("._fvdb_cpp", "")
+        return_annotation = return_annotation.replace("fvdb::", "fvdb.")
+
+    return signature, return_annotation
+
+
+def setup(app):
+    pass
+    # app.connect("autodoc-process-signature", process_signature)

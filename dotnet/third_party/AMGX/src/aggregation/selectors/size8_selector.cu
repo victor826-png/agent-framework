@@ -1,0 +1,1543 @@
+// SPDX-FileCopyrightText: 2011 - 2025 NVIDIA CORPORATION. All Rights Reserved.
+//
+// SPDX-License-Identifier: BSD-3-Clause
+
+#include <cutil.h>
+#include <util.h>
+#include <types.h>
+#include <basic_types.h>
+#include <texture.h>
+#include <matrix_analysis.h>
+#include <aggregation/selectors/size8_selector.h>
+
+#include <thrust/count.h> //count
+#include <thrust/sort.h> //sort
+#include <thrust/unique.h> //unique
+#include <thrust/remove.h> //remove
+#include <thrust/transform_scan.h> //transform_inclusive_scan
+
+#include <cusp/detail/format_utils.h> //offsets_to_indices
+
+#include <iostream>
+#include <strided_reduction.h>
+namespace amgx
+{
+
+
+namespace strided_reduction
+{
+template<int STRIDE, class scalar_t, class OP>
+void count_block_results_pinned_memory(scalar_t *out_host, const int n_blocks, scalar_t *out_d, const OP &op = OP(), cudaStream_t stream = 0)
+{
+    strided_reduction_collect_partials<scalar_t, STRIDE, 32, OP> <<< 1, 32, 0, stream>>>(out_host, out_d, n_blocks);
+    cudaCheckError();
+}
+
+
+template<class scalar_t, class OP>
+scalar_t count_block_results_pinned_memory(const int a, const int i, const int n_blocks, scalar_t *out_d, const OP &op = OP(), cudaStream_t stream = 0) //STRIDE=1 case
+{
+    static scalar_t *ret = 0;
+    static cudaEvent_t  throttle_event = 0;
+    const int buffers = 1;
+
+    if (ret == 0)
+    {
+        cudaError_t cuda_rc = amgx::memory::cudaMallocHost((void **)&ret, buffers * sizeof(scalar_t));
+        if (cuda_rc != cudaSuccess)
+        {
+            FatalError("cudaMallocHost failed in size8_selector", AMGX_ERR_CUDA_FAILURE);
+        }
+        ret[0] = 0;
+        cudaEventCreateWithFlags(&throttle_event, cudaEventDisableTiming);
+    }
+
+    int ib = i % buffers;
+    count_block_results_pinned_memory<1, scalar_t, OP>(ret + ib, n_blocks, out_d, op, stream);
+
+    if (ib == buffers - 1)
+    {
+        cudaError_t cuda_rc = cudaEventRecord(throttle_event);
+        if (cuda_rc != cudaSuccess)
+        {
+            FatalError("cudaEventRecord failed in size8_selector", AMGX_ERR_CUDA_FAILURE);
+        }
+        cuda_rc = cudaEventSynchronize(throttle_event);
+        if (cuda_rc != cudaSuccess)
+        {
+            FatalError("cudaEventSynchronize failed in size8_selector", AMGX_ERR_CUDA_FAILURE);
+        }
+        scalar_t tot = 0;
+
+        for (int j = 0; j < buffers; j++)
+        {
+            tot += ret[j];
+        }
+
+        return tot + buffers - 1;
+    }
+    else
+    {
+        return -1;
+    }
+}
+
+
+}
+
+void analyze_coloring(device_vector_alloc<int> aggregates_d, device_vector_alloc<int> colors_d);
+
+namespace aggregation
+{
+namespace size8_selector
+{
+
+#include <aggregation/selectors/common_selector.h>
+
+template <int NUM_COLS, typename IndexType>
+__global__  __launch_bounds__(256, 4)
+void my_findStrongestNeighbourBlockDiaCsr_NoMergeClean(
+    const IndexType *row_offsets, const IndexType *column_indices,
+    const float *edge_weights, const IndexType num_block_rows, const IndexType num_nonzero,
+    IndexType *aggregated, IndexType *aggregates, int *strongest_neighbour,
+    IndexType *partner_index, float *weight_strongest_neighbour, int deterministic,
+    const IndexType *unassigned_rows,
+    const int num_unassigned_row)
+{
+    int tid = threadIdx.x + blockDim.x * blockIdx.x;
+    const int lane_id = utils::lane_id();
+    bool valid_tid = false;
+
+    for (; utils::any(valid_tid = tid < num_block_rows); tid += gridDim.x * blockDim.x)
+    {
+        int jmin = -NUM_COLS * 2, jmax = -NUM_COLS * 4;
+        float weight;
+        int jcol;
+        float max_weight_unaggregated = 0;
+        int strongest_unaggregated = -1;
+        bool is_unassigned = false;
+
+        if (valid_tid)
+        {
+            is_unassigned = (__ldcs(partner_index + tid) == -1);
+        }
+
+        if (is_unassigned) // Unaggregated row
+        {
+            jmin = __ldca(row_offsets + tid);
+            jmax = __ldca(row_offsets + tid + 1);
+        }
+
+        if (utils::any(is_unassigned))
+        {
+            int jj = jmin - amgx::strided_reduction::warp_loader<int, NUM_COLS>::align_shift(jmin);
+
+            for (; utils::any(jj < jmax, utils::activemask()); jj += NUM_COLS)
+            {
+                int   I[NUM_COLS];
+                float W[NUM_COLS];
+                int   P[NUM_COLS];
+                amgx::strided_reduction::warp_loader<int, NUM_COLS>::load(column_indices, jj, num_nonzero, I);
+
+#pragma unroll
+                for (int i = 0; i < NUM_COLS; i++)
+                {
+                    int j = jj + i;
+                    jcol = I[i];
+
+                    if (j >= jmin && j < jmax)
+                    {
+                        P[i] = __ldg(partner_index + jcol); //make this load ASAP
+                    }
+                }
+
+                amgx::strided_reduction::warp_loader<float, NUM_COLS>::load(edge_weights, jj, num_nonzero, W);
+
+#pragma unroll
+                for (int i = 0; i < NUM_COLS; i++)
+                {
+                    weight = W[i];
+                    jcol = I[i];
+                    int j = jj + i;
+
+                    if (j >= jmin && j < jmax)
+                    {
+                        if (weight > max_weight_unaggregated || (weight == max_weight_unaggregated && jcol > strongest_unaggregated)) // unaggregated
+                        {
+                            if (tid != jcol && P[i] == -1)
+                            {
+                                max_weight_unaggregated = weight;
+                                strongest_unaggregated = jcol;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (strongest_unaggregated == -1) // All neighbours are aggregated
+            {
+                // Put in its own aggregate
+                if (!deterministic && is_unassigned)
+                {
+                    partner_index[tid] = tid;
+                }
+            }
+            else
+            {
+                strongest_neighbour[tid] = strongest_unaggregated;
+            }
+        }
+    }
+}
+
+
+
+#define ALGORITHM_NOMERGE 0
+#define ALGORITHM_STOREWEIGHTS 1
+#define ALGORITHM_STOREWEIGHTS_2 2
+
+
+template <int NUM_COLS, int ALGORITHM, int ASSUME_ALL_UNASSIGNED, int LOAD_ONLY_UNASSIGNED, typename IndexType>
+__global__  __launch_bounds__(256, 4)
+void my_findStrongestNeighbourBlockDiaCsr_NoMerge(
+    const IndexType *row_offsets, const IndexType *column_indices,
+    const float *edge_weights, const IndexType num_block_rows, const IndexType num_nonzero,
+    IndexType *aggregated, IndexType *aggregates, int *strongest_neighbour,
+    IndexType *partner_index, float *weight_strongest_neighbour, int deterministic,
+    const IndexType *n_unassigned_per_block, const IndexType *unassigned_per_block
+    //const int num_unassigned_row
+    //const IndexType *unassigned_rows,
+)
+{
+    int tid = threadIdx.x + blockDim.x * blockIdx.x;
+    int bid = blockIdx.x;
+    const int lane_id = utils::lane_id();
+    bool valid_tid = false;
+
+    for (; utils::any( valid_tid = tid < num_block_rows); tid += gridDim.x * blockDim.x)
+    {
+        int jmin = -NUM_COLS * 2, jmax = -NUM_COLS * 4;
+        float weight;
+        int jcol;
+        float max_weight_unaggregated = 0;
+        int strongest_unaggregated = -1;
+        float max_weight_aggregated = 0.;
+        int strongest_aggregated = -1;
+        int partner = -1;
+        int partner0, partner1, partner2;
+        int agg_jcol;
+        bool is_unassigned = false;
+        int  rowi = -1;
+
+        if (LOAD_ONLY_UNASSIGNED)
+        {
+            if (valid_tid)
+            {
+                rowi  = unassigned_per_block[tid];//unassigned_per_block+bid*256+threadIdx.x);
+                is_unassigned = (__ldg(partner_index + rowi) == -1);
+            }
+
+            if (is_unassigned)
+            {
+                jmin = __ldg(row_offsets + rowi);
+                jmax = __ldg(row_offsets + rowi + 1);
+            }
+        }
+        else
+        {
+            rowi = tid;
+
+            if (ALGORITHM == ALGORITHM_NOMERGE)
+            {
+                if (valid_tid) { is_unassigned = (__ldcs(partner_index + tid) == -1); }
+            }
+            else //ALGORITHM_STOREWEIGHTS or ALGORITHM_STOREWEIGHTS_2
+            {
+                if (valid_tid) { is_unassigned = (__ldcs(aggregated + tid) == -1); }
+            }
+
+            if (is_unassigned) // mind the else above
+            {
+                jmin = __ldg(row_offsets + rowi);
+                jmax = __ldlu(row_offsets + rowi + 1);
+            }
+        }
+
+        if (utils::any(is_unassigned))
+        {
+            if (is_unassigned) // Unaggregated row
+            {
+                if (ALGORITHM == ALGORITHM_STOREWEIGHTS)
+                {
+                    partner  = partner_index[rowi];
+                }
+                else if (ALGORITHM == ALGORITHM_STOREWEIGHTS_2)
+                {
+                    partner0 = partner_index[rowi];
+                    partner1 = partner_index[num_block_rows + rowi];
+                    partner2 = partner_index[2 * num_block_rows + rowi];
+                }
+            }
+
+            int jj = jmin - amgx::strided_reduction::warp_loader<int, NUM_COLS>::align_shift(jmin);
+
+            for (; utils::any(jj < jmax && jmax >= 0); jj += NUM_COLS)
+            {
+                int   I[NUM_COLS];
+                float W[NUM_COLS];
+                int   P[NUM_COLS];
+                int jj_ok = (jj >= 0 && jj < jmax && jmax >= 0) ? jj : 0;
+
+                amgx::strided_reduction::warp_loader<int, NUM_COLS>::load(column_indices, jj_ok, num_nonzero, I);
+#pragma unroll
+
+                for (int i = 0; i < NUM_COLS; i++)
+                {
+                    int j = jj + i;
+                    jcol = I[i];
+
+                    if (j >= jmin && j < jmax)
+                    {
+                        if (ALGORITHM == ALGORITHM_NOMERGE)
+                        {
+                            P[i] = __ldg(partner_index + jcol);    //make this load ASAP
+                        }
+                        else
+                        {
+                            P[i] = __ldg(aggregated + jcol);
+                        }
+                    }
+                }
+
+                amgx::strided_reduction::warp_loader<float, NUM_COLS>::load(edge_weights, jj_ok, num_nonzero, W);
+#pragma unroll
+
+                for (int i = 0; i < NUM_COLS; i++)
+                {
+                    weight = W[i];
+                    jcol = I[i];
+                    int j = jj + i;
+
+                    if (j >= jmin && j < jmax)
+                    {
+                        if (ALGORITHM == ALGORITHM_NOMERGE)
+                        {
+                            if (weight > max_weight_unaggregated || (weight == max_weight_unaggregated && jcol > strongest_unaggregated)) // unaggregated
+                            {
+                                if (rowi != jcol && P[i] == -1)
+                                {
+                                    max_weight_unaggregated = weight;
+                                    strongest_unaggregated = jcol;
+                                }
+                            }
+                        }
+                        else
+                        {
+                            bool partner_condition;
+
+                            if (ALGORITHM == ALGORITHM_STOREWEIGHTS)
+                            {
+                                partner_condition = jcol != partner;
+                            }
+                            else if (ALGORITHM == ALGORITHM_STOREWEIGHTS_2)
+                            {
+                                partner_condition = jcol != partner0 && jcol != partner1 && jcol != partner2;
+                            }
+
+                            agg_jcol = P[i];
+
+                            if (partner_condition && rowi != jcol)
+                            {
+                                if (agg_jcol == -1 && (weight > max_weight_unaggregated || (weight == max_weight_unaggregated && jcol > strongest_unaggregated))) // unaggregated
+                                {
+                                    max_weight_unaggregated = weight;
+                                    strongest_unaggregated = jcol;
+                                }
+                                else if (agg_jcol != -1 && (weight > max_weight_aggregated || (weight == max_weight_aggregated && jcol > strongest_aggregated))) // unaggregated
+                                {
+                                    max_weight_aggregated = weight;
+                                    strongest_aggregated = jcol;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (valid_tid && is_unassigned)
+            {
+                if (ALGORITHM == ALGORITHM_NOMERGE)
+                {
+                    if (strongest_unaggregated == -1) // All neighbours are aggregated
+                    {
+                        // Put in its own aggregate
+                        if (!deterministic)
+                        {
+                            partner_index[rowi] = rowi;
+                        }
+                    }
+                    else
+                    {
+                        strongest_neighbour[rowi] = strongest_unaggregated;
+                    }
+                }
+                else if (ALGORITHM == ALGORITHM_STOREWEIGHTS)
+                {
+                    if (strongest_unaggregated == -1) // All neighbours are aggregated
+                    {
+                        if (!deterministic)
+                        {
+                            if (strongest_aggregated != -1)
+                            {
+                                aggregates[tid] = aggregates[strongest_aggregated];
+                                aggregated[tid] = 1;
+                                aggregates[partner] = aggregates[strongest_aggregated];
+                                aggregated[partner] = 1;
+                            }
+                            else  // leave in its own aggregate
+                            {
+                                aggregated[partner] = 1;
+                                aggregated[tid] = 1;
+                            }
+                        }
+                    }
+                    else // Found an unaggregated aggregate
+                    {
+                        weight_strongest_neighbour[tid] = max_weight_unaggregated;
+                        strongest_neighbour[tid] = aggregates[strongest_unaggregated];
+                    }
+                }
+                else if (ALGORITHM == ALGORITHM_STOREWEIGHTS_2)
+                {
+                    if (strongest_unaggregated == -1 && strongest_aggregated != -1) // all neighbours are aggregated, store the strongest aggregated
+                    {
+                        weight_strongest_neighbour[tid] = -max_weight_aggregated;
+                        strongest_neighbour[tid] = aggregates[strongest_aggregated];
+                    }
+                    else if (strongest_unaggregated != -1)
+                    {
+                        weight_strongest_neighbour[tid] = max_weight_unaggregated;
+                        strongest_neighbour[tid] = aggregates[strongest_unaggregated];
+                    }
+                }
+            }
+        }
+
+        bid += gridDim.x;
+    }
+}
+
+
+
+
+#define INST_my_findStrongestNeighbourBlockDiaCsr_NoMerge(numcols, algo,assume,c) template __global__ void my_findStrongestNeighbourBlockDiaCsr_NoMerge<numcols,algo,assume,c>(\
+const int *row_offsets, const int *column_indices,\
+const float *edge_weights, const int num_block_rows,const int num_nonzero,\
+int *aggregated, int *aggregates, int *strongest_neighbour,\
+int *partner_index, float *weight_strongest_neighbour, int deterministic,\
+const int* n_unassigned_per_block, const int * unassigned_per_block);
+
+#define INSTmy_findStrongestNeighbourBlockDiaCsr_NoMergeClean(numcols) template __global__ void my_findStrongestNeighbourBlockDiaCsr_NoMergeClean<numcols,int>(\
+const int *row_offsets, const int *column_indices,\
+const float *edge_weights, const int num_block_rows,const int num_nonzero,\
+int *aggregated, int *aggregates, int *strongest_neighbour,\
+int *partner_index, float *weight_strongest_neighbour, int deterministic,\
+const int *unassigned_rows,\
+const int num_unassigned_row);
+
+INST_my_findStrongestNeighbourBlockDiaCsr_NoMerge(1, ALGORITHM_NOMERGE, 0, 0)
+INST_my_findStrongestNeighbourBlockDiaCsr_NoMerge(1, ALGORITHM_STOREWEIGHTS, 0, 0)
+INST_my_findStrongestNeighbourBlockDiaCsr_NoMerge(1, ALGORITHM_STOREWEIGHTS_2, 0, 0)
+INST_my_findStrongestNeighbourBlockDiaCsr_NoMerge(1, ALGORITHM_NOMERGE, 1, 0)
+INST_my_findStrongestNeighbourBlockDiaCsr_NoMerge(1, ALGORITHM_STOREWEIGHTS, 1, 0)
+INST_my_findStrongestNeighbourBlockDiaCsr_NoMerge(1, ALGORITHM_STOREWEIGHTS_2, 1, 0)
+INST_my_findStrongestNeighbourBlockDiaCsr_NoMerge(1, ALGORITHM_NOMERGE, 0, 1) //load only unassigned
+
+INST_my_findStrongestNeighbourBlockDiaCsr_NoMerge(2, ALGORITHM_NOMERGE, 0, 0)
+INST_my_findStrongestNeighbourBlockDiaCsr_NoMerge(2, ALGORITHM_STOREWEIGHTS, 0, 0)
+INST_my_findStrongestNeighbourBlockDiaCsr_NoMerge(2, ALGORITHM_STOREWEIGHTS_2, 0, 0)
+INST_my_findStrongestNeighbourBlockDiaCsr_NoMerge(2, ALGORITHM_NOMERGE, 1, 0)
+INST_my_findStrongestNeighbourBlockDiaCsr_NoMerge(2, ALGORITHM_STOREWEIGHTS, 1, 0)
+INST_my_findStrongestNeighbourBlockDiaCsr_NoMerge(2, ALGORITHM_STOREWEIGHTS_2, 1, 0)
+INST_my_findStrongestNeighbourBlockDiaCsr_NoMerge(2, ALGORITHM_NOMERGE, 0, 1) //load only unassigned
+
+INST_my_findStrongestNeighbourBlockDiaCsr_NoMerge(4, ALGORITHM_NOMERGE, 0, 0)
+INST_my_findStrongestNeighbourBlockDiaCsr_NoMerge(4, ALGORITHM_STOREWEIGHTS, 0, 0)
+INST_my_findStrongestNeighbourBlockDiaCsr_NoMerge(4, ALGORITHM_STOREWEIGHTS_2, 0, 0)
+INST_my_findStrongestNeighbourBlockDiaCsr_NoMerge(4, ALGORITHM_NOMERGE, 1, 0)
+INST_my_findStrongestNeighbourBlockDiaCsr_NoMerge(4, ALGORITHM_STOREWEIGHTS, 1, 0)
+INST_my_findStrongestNeighbourBlockDiaCsr_NoMerge(4, ALGORITHM_STOREWEIGHTS_2, 1, 0)
+INST_my_findStrongestNeighbourBlockDiaCsr_NoMerge(4, ALGORITHM_NOMERGE, 0, 1) //load only unassigned
+
+
+INSTmy_findStrongestNeighbourBlockDiaCsr_NoMergeClean(1)
+INSTmy_findStrongestNeighbourBlockDiaCsr_NoMergeClean(2)
+INSTmy_findStrongestNeighbourBlockDiaCsr_NoMergeClean(4)
+
+template<int ALREADY_COMPACT>
+__global__ void my_blockCompact(
+    int *partner_index, const int num_rows,
+    int *unassigned_per_block_in,
+    int *n_unassigned_per_block, int *unassigned_per_block)
+{
+    int bid = blockIdx.x; //RMV
+    int tid = threadIdx.x + blockDim.x * blockIdx.x;
+
+    for (; bid < num_rows / 256 + 1/*__any(tid < num_rows)*/; tid += gridDim.x * blockDim.x)
+    {
+        int row = tid;
+        bool no_partner = 0; //RMV
+
+        if (tid < num_rows)
+        {
+            if (ALREADY_COMPACT)
+            {
+                row = unassigned_per_block_in[tid];
+            }
+
+            if (partner_index[row] == -1) // Unaggregated row
+            {
+                no_partner = 1;
+            }
+        }
+
+        amgx::strided_reduction::block_binary_compaction<256, 32, 1>(
+            n_unassigned_per_block, unassigned_per_block, bid,
+            no_partner, row);
+        bid += gridDim.x;
+    }
+}
+
+template __global__ void my_blockCompact<0>(
+    int *partner_index, const int num_rows,
+    int *unassigned_per_block_in,
+    int *n_unassigned_per_block, int *unassigned_per_block);
+template __global__ void my_blockCompact<1>(
+    int *partner_index, const int num_rows,
+    int *unassigned_per_block_in,
+    int *n_unassigned_per_block, int *unassigned_per_block);
+
+__global__ void my_MatchEdgesWithCompaction(const int num_rows, int *partner_index, int *aggregates, const int *strongest_neighbour, int *sets_per_block,
+        int *unassigned_per_block_in, int *n_unassigned_per_block, int *unassigned_per_block
+                                           )
+{
+    int potential_match, potential_match_neighbour;
+    int warp_count = 0;
+    int bid = blockIdx.x; //RMV
+    int tid = threadIdx.x + blockDim.x * blockIdx.x;
+
+    for (; bid < num_rows / 1024 + 1/*__any(tid < num_rows)*/; tid += gridDim.x * blockDim.x)
+    {
+        int row = tid;
+        bool no_partner = 0;
+
+        if (tid < num_rows)
+        {
+            if (partner_index[row] == -1) // Unaggregated row
+            {
+                no_partner = 1;
+                potential_match = strongest_neighbour[row];
+
+                if (potential_match != -1)
+                {
+                    potential_match_neighbour = __ldcs(strongest_neighbour + potential_match);
+
+                    if ( potential_match_neighbour == row ) // we have a match
+                    {
+                        no_partner = 0;
+                        //partner_notnull = 1;//RMV
+                        partner_index[row] = potential_match;
+                        aggregates[row] = ( potential_match > row ) ? row : potential_match;
+                    }
+                }
+            }
+        }
+
+        amgx::strided_reduction::block_binary_compaction<1024, 32, 1>(
+            n_unassigned_per_block, unassigned_per_block, bid,
+            no_partner, row);
+        warp_count += amgx::strided_reduction::warp_binary_count(no_partner);
+        bid += gridDim.x;
+    }
+
+    amgx::strided_reduction::block_count<1, 1024, 32, int>(warp_count, sets_per_block);
+}
+
+__global__ void my_MatchEdges(const int num_rows, int *partner_index, int *aggregates, const int *strongest_neighbour, int *sets_per_block)
+{
+    int potential_match, potential_match_neighbour;
+    int warp_count = 0;
+
+    for (int tid = threadIdx.x + blockDim.x * blockIdx.x; utils::any(tid < num_rows); tid += gridDim.x * blockDim.x)
+    {
+        bool has_set_partner_index = 0;
+
+        if (tid < num_rows)
+        {
+            if (partner_index[tid] == -1) // Unaggregated row
+            {
+                potential_match = strongest_neighbour[tid];
+
+                if (potential_match != -1)
+                {
+                    potential_match_neighbour = __ldcs(strongest_neighbour + potential_match);
+
+                    if ( potential_match_neighbour == tid ) // we have a match
+                    {
+                        has_set_partner_index = 1;
+                        partner_index[tid] = potential_match;
+                        aggregates[tid] = ( potential_match > tid) ? tid : potential_match;
+                    }
+                }
+            }
+        }
+
+        warp_count += amgx::strided_reduction::warp_binary_count(has_set_partner_index);
+    }
+
+    amgx::strided_reduction::block_count<1, 1024, 32, int>(warp_count, sets_per_block);
+}
+
+
+// matchEdges
+__global__ void my_joinExistingAggregates(int num_rows, int *aggregates, int *aggregated, int *aggregates_candidate, int *sets_per_block)
+{
+    int tid = threadIdx.x + blockDim.x * blockIdx.x;
+    int warp_count = 0;
+
+    while  (utils::any(tid < num_rows))
+    {
+        bool has_set_partner_index = 0;
+
+        if (tid < num_rows)
+        {
+            if (aggregated[tid] == -1 && aggregates_candidate[tid] != -1) // Unaggregated row
+            {
+                aggregates[tid] = aggregates_candidate[tid];
+                aggregated[tid] = 1;
+                has_set_partner_index = 1;
+            }
+        }
+
+        warp_count += amgx::strided_reduction::warp_binary_count(has_set_partner_index);
+        tid += gridDim.x * blockDim.x;
+    }
+
+    amgx::strided_reduction::block_count<1, 1024, 32, int>(warp_count, sets_per_block);
+}
+
+
+// Kernel that checks if perfect matchs exist
+__global__ void my_matchAggregates(int *aggregates, int *aggregated, int *strongest_neighbour, const int num_rows, int *sets_per_block)
+{
+    int tid = threadIdx.x + blockDim.x * blockIdx.x;
+    int potential_match, potential_match_neighbour, my_aggregate;
+    int warp_count = 0;
+
+    while (utils::any(tid < num_rows))
+    {
+        bool has_set_partner_index = 0;
+
+        if (tid < num_rows) if (aggregated[tid] == -1) // Unaggregated row
+            {
+                potential_match = strongest_neighbour[tid];
+
+                if (potential_match != -1)
+                {
+                    potential_match_neighbour = __ldcs(strongest_neighbour + potential_match); //or global
+                    my_aggregate = aggregates[tid];
+
+                    if (potential_match_neighbour == my_aggregate) // we have a match
+                    {
+                        has_set_partner_index = 1;
+                        aggregated[tid] = 1;
+                        aggregates[tid] = ( potential_match > my_aggregate) ? my_aggregate : potential_match;
+                    }
+                }
+            }
+
+        warp_count += amgx::strided_reduction::warp_binary_count(has_set_partner_index);
+        tid += gridDim.x * blockDim.x;
+    }
+
+    amgx::strided_reduction::block_count<1, 1024, 32, int>(warp_count, sets_per_block);
+}
+
+
+// Kernel that checks if perfect matchs exist
+__global__ void my_matchAggregatesSize4(int *aggregates, int *aggregated, int *strongest_neighbour, int *partner_index, const int num_rows, int *sets_per_block)
+{
+    int potential_match, potential_match_neighbour, my_aggregate;
+    int warp_count = 0;
+
+    for (int tid = threadIdx.x + blockDim.x * blockIdx.x; utils::any(tid < num_rows); tid += blockDim.x * gridDim.x)
+    {
+        bool has_set_partner_index = 0;
+
+        if (tid < num_rows) if (aggregated[tid] == -1) // Unaggregated row
+            {
+                potential_match = strongest_neighbour[tid];
+
+                if (potential_match != -1)
+                {
+                    potential_match_neighbour = __ldcs(strongest_neighbour + potential_match);
+                    my_aggregate = aggregates[tid];
+
+                    if (potential_match_neighbour == my_aggregate) // we have a match
+                    {
+                        has_set_partner_index = 1;
+                        aggregated[tid] = 1;
+                        aggregates[tid] = ( potential_match > my_aggregate) ? my_aggregate : potential_match;
+                        partner_index[tid + num_rows] = potential_match;
+                        partner_index[tid + 2 * num_rows] = partner_index[potential_match];
+                    }
+                }
+            }
+
+        warp_count += amgx::strided_reduction::warp_binary_count(has_set_partner_index);
+    }
+
+    amgx::strided_reduction::block_count<1, 1024, 32, int>(warp_count, sets_per_block);
+}
+
+// ------------------------
+//  Kernels
+// ------------------------
+
+// findStrongestNeighbour kernel for block_dia_csr_matrix format
+// Reads the weight from edge_weights array
+template <typename IndexType>
+__global__
+void findStrongestNeighbourBlockDiaCsr_StoreWeight_2(const IndexType *row_offsets, const IndexType *column_indices,
+        const float *edge_weights, const IndexType num_block_rows, IndexType *aggregated, IndexType *aggregates, int *strongest_neighbour, IndexType *partner_index, float *weight_strongest_neighbour)
+{
+    float weight;
+    int jcol, jmin, jmax;
+    int partner0, partner1, partner2;
+    int agg_jcol;
+
+    for (int tid = threadIdx.x + blockDim.x * blockIdx.x; tid < num_block_rows; tid += blockDim.x * gridDim.x)
+    {
+        float max_weight_unaggregated = 0.;
+        float max_weight_aggregated = 0.;
+        int strongest_unaggregated = -1;
+        int strongest_aggregated = -1;
+
+        if (aggregated[tid] == -1) // Unaggregated row
+        {
+            partner0 = partner_index[tid];
+            partner1 = partner_index[num_block_rows + tid];
+            partner2 = partner_index[2 * num_block_rows + tid];
+            jmin = row_offsets[tid];
+            jmax = row_offsets[tid + 1];
+
+            for (int j = jmin; j < jmax; j++)
+            {
+                jcol = column_indices[j];
+
+                if (jcol == tid || jcol >= num_block_rows) { continue; }
+
+                weight = edge_weights[j];
+                agg_jcol = aggregated[jcol];
+
+                if (jcol != partner0 && jcol != partner1 && jcol != partner2)
+                {
+                    if (agg_jcol == -1 && (weight > max_weight_unaggregated || (weight == max_weight_unaggregated && jcol > strongest_unaggregated))) // unaggregated
+                    {
+                        max_weight_unaggregated = weight;
+                        strongest_unaggregated = jcol;
+                    }
+                    else if (agg_jcol != -1 && (weight > max_weight_aggregated || (weight == max_weight_aggregated && jcol > strongest_aggregated))) // unaggregated
+                    {
+                        max_weight_aggregated = weight;
+                        strongest_aggregated = jcol;
+                    }
+                }
+            }
+
+            if (strongest_unaggregated == -1 && strongest_aggregated != -1) // all neighbours are aggregated, store the strongest aggregated
+            {
+                weight_strongest_neighbour[tid] = -max_weight_aggregated;
+                strongest_neighbour[tid] = aggregates[strongest_aggregated];
+            }
+            else if (strongest_unaggregated != -1)
+            {
+                weight_strongest_neighbour[tid] = max_weight_unaggregated;
+                strongest_neighbour[tid] = aggregates[strongest_unaggregated];
+            }
+        }
+    }
+}
+
+// findStrongestNeighbour kernel for block_dia_csr_matrix format
+// Reads the weight from edge_weights array
+template <typename IndexType>
+__global__
+void agreeOnProposal_2(const IndexType *row_offsets, const IndexType *column_indices,
+                       IndexType num_block_rows, IndexType *aggregated, int *strongest_neighbour, float *weight_strongest_neighbour, IndexType *partner_index, int *aggregates, int deterministic)
+{
+    int partner[3];
+    float weight[3];
+
+    for (int tid = threadIdx.x + blockDim.x * blockIdx.x; tid < num_block_rows; tid += blockDim.x * gridDim.x)
+    {
+        int strongest_partner = -1;
+        float my_weight = 0.;
+
+        if (aggregated[tid] == -1)
+        {
+            my_weight = weight_strongest_neighbour[tid];
+#pragma unroll
+
+            for (int m = 0; m < 3; m++)
+            {
+                partner[m] = partner_index[tid + m * num_block_rows];
+            }
+
+#pragma unroll
+
+            for (int m = 0; m < 3; m++)
+            {
+                weight[m] = weight_strongest_neighbour[partner[m]];
+            }
+
+#pragma unroll
+
+            for (int m = 0; m < 3; m++)
+            {
+                //if (weight[m] > my_weight && weight[m] > 0.) // there is a partner that has an unaggregated neighbour
+                if (weight[m] > my_weight)
+                {
+                    if (weight[m] > 0.) // there is a partner that has an unaggregated neighbour
+                    {
+                        strongest_partner = m;
+                        my_weight = weight[m];
+                    }
+                }
+                else if (weight[m] < my_weight)   // there is a partner without an unaggregated neighbour, whose neighbour is stronger than mine
+                {
+                    if (my_weight < 0.)
+                    {
+                        strongest_partner = m;
+                        my_weight = weight[m];
+                    }
+                }
+            }
+
+            if (my_weight < 0.) // means all neighbours of vertices in aggregate are aggregated, merge to another aggregate
+            {
+                if (!deterministic)
+                {
+                    aggregated[tid] = 1;
+                    aggregates[tid] = strongest_partner != -1 ? strongest_neighbour[partner[strongest_partner]] : strongest_neighbour[tid];
+                }
+            }
+            else if (strongest_partner != -1)   // store my partner's pick
+            {
+                strongest_neighbour[tid] = strongest_neighbour[partner[strongest_partner]];
+            }
+        }
+    }
+}
+
+template <typename IndexType>
+__global__
+void agreeOnProposal_2_deterministic(int *strongest_neighbour_out, const IndexType *row_offsets, const IndexType *column_indices,
+                                     IndexType num_block_rows, IndexType *aggregated, int *strongest_neighbour, float *weight_strongest_neighbour, IndexType *partner_index, int *aggregates, int deterministic)
+{
+    int partner[3];
+    float weight[3];
+
+    for (int tid = threadIdx.x + blockDim.x * blockIdx.x; tid < num_block_rows; tid += blockDim.x * gridDim.x)
+    {
+        int strongest_partner = -1;
+        float my_weight = 0.;
+        //copy here to avoid redundant copies before launching the kernel
+        int new_strongest_neighbour_out = strongest_neighbour[tid];
+
+        if (aggregated[tid] == -1)
+        {
+            my_weight = weight_strongest_neighbour[tid];
+#pragma unroll
+
+            for (int m = 0; m < 3; m++)
+            {
+                partner[m] = partner_index[tid + m * num_block_rows];
+            }
+
+#pragma unroll
+
+            for (int m = 0; m < 3; m++)
+            {
+                weight[m] = weight_strongest_neighbour[partner[m]];
+            }
+
+#pragma unroll
+
+            for (int m = 0; m < 3; m++)
+            {
+                if (weight[m] > my_weight)
+                {
+                    if (weight[m] > 0.) // there is a partner that has an unaggregated neighbour
+                    {
+                        strongest_partner = m;
+                        my_weight = weight[m];
+                    }
+                }
+                else if (weight[m] < my_weight)   // there is a partner without an unaggregated neighbour, whose neighbour is stronger than mine
+                {
+                    if (my_weight < 0.)
+                    {
+                        strongest_partner = m;
+                        my_weight = weight[m];
+                    }
+                }
+            }
+
+            if (my_weight < 0.) // means all neighbours of vertices in aggregate are aggregated, merge to another aggregate
+            {
+                if (!deterministic)
+                {
+                    aggregated[tid] = 1;
+                    aggregates[tid] = strongest_partner != -1 ? strongest_neighbour[partner[strongest_partner]] : strongest_neighbour[tid];
+                }
+            }
+            else if (strongest_partner != -1)   // store my partner's pick
+            {
+                new_strongest_neighbour_out = strongest_neighbour[partner[strongest_partner]];
+            }
+        }
+
+        //copy here to avoid redundant copies before launching the kernel
+        strongest_neighbour_out[tid] = new_strongest_neighbour_out;
+    }
+}
+
+
+// Kernel that checks if perfect matchs exist
+template <typename IndexType>
+__global__
+void matchAggregatesSize4(IndexType *aggregates, IndexType *aggregated, IndexType *strongest_neighbour, IndexType *partner_index, const IndexType num_rows)
+{
+    int potential_match, potential_match_neighbour, my_aggregate;
+
+    for (int tid = threadIdx.x + blockDim.x * blockIdx.x; tid < num_rows; tid += blockDim.x * gridDim.x)
+    {
+        if (aggregated[tid] == -1) // Unaggregated row
+        {
+            potential_match = strongest_neighbour[tid];
+
+            if (potential_match != -1)
+            {
+                potential_match_neighbour = strongest_neighbour[potential_match];
+                my_aggregate = aggregates[tid];
+
+                if (potential_match_neighbour == my_aggregate) // we have a match
+                {
+                    aggregated[tid] = 1;
+                    aggregates[tid] = ( potential_match > my_aggregate) ? my_aggregate : potential_match;
+                    partner_index[tid + num_rows] = potential_match;
+                    partner_index[tid + 2 * num_rows] = partner_index[potential_match];
+                }
+            }
+        }
+    }
+}
+
+
+template <typename IndexType>
+__global__
+void assignUnassignedVertices_2(IndexType *partner_index, const IndexType num_rows)
+{
+    for (int tid = threadIdx.x + blockDim.x * blockIdx.x; tid < num_rows; tid += blockDim.x * gridDim.x)
+    {
+        if (partner_index[num_rows + tid] == -1) // Unaggregated row
+        {
+            partner_index[num_rows + tid] = tid;
+        }
+
+        if (partner_index[2 * num_rows + tid] == -1) // Unaggregated row
+        {
+            partner_index[2 * num_rows + tid] = tid;
+        }
+    }
+}
+
+
+// -----------------
+//  Methods
+// ----------------
+
+// Constructor
+template<class T_Config>
+Size8SelectorBase<T_Config>::Size8SelectorBase(AMG_Config &cfg, const std::string &cfg_scope)
+{
+    deterministic = cfg.AMG_Config::template getParameter<IndexType>("determinism_flag", "default");
+    max_iterations = cfg.AMG_Config::template getParameter<IndexType>("max_matching_iterations", cfg_scope);
+    numUnassigned_tol = cfg.AMG_Config::template getParameter<double>("max_unassigned_percentage", cfg_scope);
+    m_aggregation_edge_weight_component = cfg.AMG_Config::template getParameter<int>("aggregation_edge_weight_component", cfg_scope);
+    weight_formula = cfg.AMG_Config::template getParameter<int>("weight_formula", cfg_scope);
+}
+
+
+// setAggregates for block_dia_csr_matrix_h format
+template <AMGX_VecPrecision t_vecPrec, AMGX_MatPrecision t_matPrec, AMGX_IndPrecision t_indPrec>
+void Size8Selector<TemplateConfig<AMGX_host, t_vecPrec, t_matPrec, t_indPrec> >::setAggregates_common_sqblock(const Matrix_h &A,
+        IVector &aggregates, IVector &aggregates_global, int &num_aggregates)
+{
+    FatalError("Size8 selector: setAggregates not implemented on CPU, exiting", AMGX_ERR_NOT_SUPPORTED_TARGET);
+}
+
+
+template <int NUM_COLS, typename IndexType, typename ValueType>
+__global__ //__launch_bounds__(256,2)
+void computeEdgeWeightsBlockDiaCsr_V2_1(
+    const IndexType *row_offsets,
+    //const int* __myrestrict row_offsets,
+    const IndexType *row_indices,
+    const IndexType *column_indices,
+    const IndexType *dia_values,
+    const ValueType *nonzero_values,
+    //const ValueType* __restrict nonzero_values,
+    const IndexType num_nonzero_blocks,
+    float *str_edge_weights, float *rand_edge_weights, int num_owned, int bsize, int component)
+{
+    int tid = threadIdx.x + blockDim.x * blockIdx.x;
+    int i, j;
+    int bsize_sq = bsize * bsize;
+    float kvalue;
+    int matrix_weight_entry = component * bsize + component;
+    bool valid_tid;
+
+    while (utils::any(valid_tid = tid < num_nonzero_blocks))
+    {
+        i = -1;
+        double d1, d2, w1;
+
+        if (valid_tid)
+        {
+            if ( rand_edge_weights != NULL )
+            {
+                rand_edge_weights[tid] = random_weight(i, j, num_owned);
+            }
+
+            i  = row_indices[tid];
+            j  = column_indices[tid];
+            d1 = types::util<ValueType>::abs(__cachingLoad(&nonzero_values[__ldg(dia_values + i) * bsize_sq + matrix_weight_entry]));
+            d2 = types::util<ValueType>::abs(__cachingLoad(&nonzero_values[__ldg(dia_values + j) * bsize_sq + matrix_weight_entry]));
+        }
+
+        const bool valid_j = valid_tid && i != j && j < num_owned;
+        int ki = -1; //my transpose index, initialized to not found
+        //int diag_j = -1; //j diagonal index
+
+        if (!utils::any(valid_j))
+        {
+            continue;
+        }
+
+        int kmin = 0, kmax = 0;
+
+        if (valid_j)
+        {
+            kmin = __cachingLoad(&row_offsets[j  ]);
+            kmax = __cachingLoad(&row_offsets[j + 1]);
+        }
+
+        for ( int k = kmin ; k < kmax ; ++k )
+        {
+            const int idx = __ldg(column_indices + k);
+
+            if (idx == i)
+            {
+                ki = k;    //find the transpose ji
+            }
+        }
+
+        kvalue = 0.0f;
+
+        if (ki > -1)
+        {
+            kvalue = types::util<ValueType>::abs(__cachingLoad(&nonzero_values[ki * bsize_sq + matrix_weight_entry]));
+        }
+
+        if (valid_tid)
+        {
+            w1 = types::util<ValueType>::abs(__cachingLoad(&nonzero_values[tid * bsize_sq + matrix_weight_entry]));
+            str_edge_weights[tid] = 0.5 * (w1 + kvalue) / ( (float) max(d1, d2) ) * valid_j;
+        }
+
+        tid += gridDim.x * blockDim.x;
+    }
+}
+
+#if AMGX_ASYNCCPU_PROOF_OF_CONCEPT
+
+template<class T, class M, class V>
+struct async_size8_task : public task_cuda
+{
+    T *size8;
+    M *A;
+    V *aggregates;
+    V *aggregates_global;
+    int *num_aggregates;
+
+    typedef typename T::IndexType IndexType;
+
+    void run()
+    {
+        const IndexType nnz_per_row = (*A).get_num_nz() / (*A).get_num_rows();
+
+        if (0)
+        {
+        }
+        else if (nnz_per_row > 2)
+        {
+            size8->template setAggregates_common_sqblock_avg_specialized<4>(*A, *aggregates, *aggregates_global, *num_aggregates);
+        }
+        else if (nnz_per_row > 1)
+        {
+            size8->template setAggregates_common_sqblock_avg_specialized<4>(*A, *aggregates, *aggregates_global, *num_aggregates);
+        }
+        else
+        {
+            size8->template setAggregates_common_sqblock_avg_specialized<2>(*A, *aggregates, *aggregates_global, *num_aggregates);
+        }
+    }
+};
+
+
+template<class T, class M, class V>
+async_size8_task<T, M, V> *make_async_size8_task(T *size8, M &A, V &aggregates, V &aggregates_global, int &num_aggregates)
+{
+    async_size8_task<T, M, V> *ret = new async_size8_task<T, M, V>;
+    ret->size8 = size8;
+    ret->A = &A;
+    ret->aggregates = &aggregates;
+    ret->aggregates_global = &aggregates_global;
+    ret->num_aggregates = &num_aggregates;
+    static task_chain_cuda_streamset *ss = new task_chain_cuda_streamset(1);
+    task_chain_cuda *cr = new task_chain_cuda(ss);
+    cr->append(ret, asyncmanager::singleton()->main_thread_queue(2));
+    return ret;
+}
+
+#endif
+
+template <AMGX_VecPrecision t_vecPrec, AMGX_MatPrecision t_matPrec, AMGX_IndPrecision t_indPrec>
+void Size8Selector<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >::setAggregates_common_sqblock(const Matrix_d &A,
+        typename Matrix_d::IVector &aggregates,
+        typename Matrix_d::IVector &aggregates_global,
+        int &num_aggregates)
+{
+#if AMGX_ASYNCCPU_PROOF_OF_CONCEPT
+    bool task = false;
+    bool push = false;
+
+    if (task)
+    {
+        task_cuda *t = make_async_size8_task(this, A, aggregates, aggregates_global, num_aggregates);
+        enqueue_async_get_receipt(asyncmanager::singleton()->global_parallel_queue, t)->wait();
+        return;
+    }
+
+    cudaStream_t stream_old;
+    static cudaStream_t stream = 0;
+
+    if (push)
+    {
+        stream_old = amgx::thrust::global_thread_handle::threadStream[getCurrentThreadId()];
+        cudaError_t cuda_rc = cudaStreamSynchronize(amgx::thrust::global_thread_handle::threadStream[getCurrentThreadId()]);
+        if (cuda_rc != cudaSuccess)
+        {
+            FatalError("cudaStreamSynchronize failed in size8_selector", AMGX_ERR_CUDA_FAILURE);
+        }
+
+        if (stream == 0) { cudaStreamCreate(&stream); cudaCheckError(); }
+
+        amgx::thrust::global_thread_handle::threadStream[getCurrentThreadId()] = stream;
+    }
+
+#endif
+    const IndexType nnz_per_row = A.get_num_nz() / A.get_num_rows();
+
+    if (0)
+    {
+    }
+    else if (nnz_per_row > 2)
+    {
+        setAggregates_common_sqblock_avg_specialized<4>(A, aggregates, aggregates_global, num_aggregates);
+    }
+    else if (nnz_per_row > 1)
+    {
+        setAggregates_common_sqblock_avg_specialized<4>(A, aggregates, aggregates_global, num_aggregates);
+    }
+    else
+    {
+        setAggregates_common_sqblock_avg_specialized<2>(A, aggregates, aggregates_global, num_aggregates);
+    }
+
+#if AMGX_ASYNCCPU_PROOF_OF_CONCEPT
+
+    if (push)
+    {
+        //cudaStreamSynchronize(stream);
+        cudaCheckError();
+        //amgx::thrust::global_thread_handle::threadStream[getCurrentThreadId()] = stream_old;
+    }
+
+#endif
+}
+
+// setAggregates for block_dia_csr_matrix_d format
+template <AMGX_VecPrecision t_vecPrec, AMGX_MatPrecision t_matPrec, AMGX_IndPrecision t_indPrec>
+template<int AVG_NNZ>
+void Size8Selector<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >:: setAggregates_common_sqblock_avg_specialized(const Matrix_d &A,
+        typename Matrix_d::IVector &aggregates, typename Matrix_d::IVector &aggregates_global, int &num_aggregates)
+{
+#if AMGX_ASYNCCPU_PROOF_OF_CONCEPT
+    cudaStream_t stream = amgx::thrust::global_thread_handle::threadStream[getCurrentThreadId()];
+#else
+    cudaStream_t stream = amgx::thrust::global_thread_handle::get_stream();
+#endif
+    const IndexType num_block_rows = A.get_num_rows();
+    const IndexType num_nonzero_blocks = A.get_num_nz();
+
+    if (!A.is_matrix_singleGPU())
+    {
+        aggregates.resize(A.manager->halo_offset(A.manager->num_neighbors()));
+    }
+    else
+    {
+        aggregates.resize(num_block_rows);
+    }
+
+    // Initially, put each vertex in its own aggregate
+    thrust_wrapper::sequence<AMGX_device>(aggregates.begin(), aggregates.begin() + num_block_rows);
+    cudaCheckError();
+    IndexType *aggregates_ptr = aggregates.raw();
+    // Create row_indices array
+    IndexType total_nz = (A.is_matrix_singleGPU()) ? num_nonzero_blocks : A.manager->num_nz_all();
+    typename Matrix_d::IVector row_indices(total_nz);
+    cusp::detail::offsets_to_indices(A.row_offsets, row_indices);
+    const IndexType *A_row_offsets_ptr = A.row_offsets.raw();
+    const IndexType *A_row_indices_ptr = row_indices.raw();
+    const IndexType *A_column_indices_ptr = A.col_indices.raw();
+    const IndexType *A_dia_idx_ptr = A.diag.raw();
+    //const ValueType *A_dia_val_ptr = amgx::thrust::raw_pointer_cast(&A.values[A.get_block_size()*A.diagOffset()]);
+    const ValueType *A_nonzero_values_ptr = A.values.raw();
+    typename Matrix_d::IVector strongest_neighbour(num_block_rows, -1);
+    typename Matrix_d::IVector partner_index(3 * num_block_rows, -1);
+    typename Matrix_d::IVector strongest_neighbour_tmp(num_block_rows);
+    IndexType *strongest_neighbour_ptr = strongest_neighbour.raw();
+    IndexType *partner_index_ptr = partner_index.raw();
+    const int threads_per_block = 256;
+    const int num_blocks = std::min( AMGX_GRID_MAX_SIZE, (num_block_rows - 1) / threads_per_block + 1);
+    int numUnassigned = num_block_rows;
+    int numUnassigned_previous = numUnassigned;
+    Vector<TemplateConfig<AMGX_device, AMGX_vecFloat, t_matPrec, t_indPrec> > edge_weights(num_nonzero_blocks + 8); //8-padded
+    float *edge_weights_ptr = edge_weights.raw();
+    float *rand_edge_weights_ptr = NULL;
+    const int num_blocks_V2 = std::min( AMGX_GRID_MAX_SIZE, (num_nonzero_blocks - 1) / threads_per_block + 1);
+    // Compute the edge weights
+#if AMGX_ASYNCCPU_PROOF_OF_CONCEPT
+    int avoid_thrust_count = 1;//0;
+    int newFindStrongest = 1;//0;
+    int newWeights = 1;//0;
+#else
+    int avoid_thrust_count = 0;//0;
+    int newFindStrongest = 0;//0;
+    int newWeights = 0;//0;
+#endif
+    int usenumassignedassumption = false;
+
+    if (newWeights == 0)
+    {
+        cudaFuncSetCacheConfig(computeEdgeWeightsBlockDiaCsr_V2<IndexType, ValueType, float>, cudaFuncCachePreferL1);
+        computeEdgeWeightsBlockDiaCsr_V2 <<< num_blocks_V2, threads_per_block, 0, stream>>>(
+            A_row_offsets_ptr, A_row_indices_ptr, A_column_indices_ptr, A_dia_idx_ptr, A_nonzero_values_ptr, num_nonzero_blocks, edge_weights_ptr, rand_edge_weights_ptr, num_block_rows, A.get_block_dimy(), this->m_aggregation_edge_weight_component, this->weight_formula);
+        cudaCheckError();
+    }
+    else
+    {
+        cudaFuncSetCacheConfig(computeEdgeWeightsBlockDiaCsr_V2_1<AVG_NNZ, IndexType, ValueType>, cudaFuncCachePreferL1);
+        computeEdgeWeightsBlockDiaCsr_V2_1<AVG_NNZ, IndexType, ValueType> <<< num_blocks_V2, threads_per_block, 0, stream>>>(
+            A_row_offsets_ptr, A_row_indices_ptr, A_column_indices_ptr, A_dia_idx_ptr, A_nonzero_values_ptr, num_nonzero_blocks, edge_weights_ptr, rand_edge_weights_ptr, num_block_rows, A.get_block_dimy(), this->m_aggregation_edge_weight_component);
+        cudaCheckError();
+    }
+
+    // -------------------------------------------------
+    // First create aggregates of size 2
+    // -------------------------------------------------
+    int icount = 0;
+    const int num_blocks_1024 = std::min( 13 * 2, (num_block_rows - 1) / 1024 + 1);
+    device_vector_alloc<int> sets_per_block_t(num_blocks_1024);
+    int *sets_per_block = amgx::thrust::raw_pointer_cast(sets_per_block_t.data());
+    cudaCheckError();
+
+    do
+    {
+        if (newFindStrongest)
+        {
+            if (numUnassigned == num_block_rows && usenumassignedassumption)
+            {
+                cudaFuncSetCacheConfig(my_findStrongestNeighbourBlockDiaCsr_NoMerge<AVG_NNZ, ALGORITHM_NOMERGE, 1, 0, int>, cudaFuncCachePreferL1);
+                my_findStrongestNeighbourBlockDiaCsr_NoMerge<AVG_NNZ, ALGORITHM_NOMERGE, 1, 0, int> <<< num_blocks, threads_per_block, 0, stream>>>(
+                    A_row_offsets_ptr, A_column_indices_ptr, edge_weights_ptr, num_block_rows, num_nonzero_blocks,  0, 0, strongest_neighbour_ptr, partner_index_ptr, 0, this->deterministic, 0, 0);
+                    cudaCheckError();
+            }
+            else
+            {
+                cudaFuncSetCacheConfig(my_findStrongestNeighbourBlockDiaCsr_NoMerge<AVG_NNZ, ALGORITHM_NOMERGE, 0, 0, int>, cudaFuncCachePreferL1);
+                my_findStrongestNeighbourBlockDiaCsr_NoMerge<AVG_NNZ, ALGORITHM_NOMERGE, 0, 0, int> <<< num_blocks, threads_per_block, 0, stream>>>(
+                    A_row_offsets_ptr, A_column_indices_ptr, edge_weights_ptr, num_block_rows, num_nonzero_blocks, 0, 0, strongest_neighbour_ptr, partner_index_ptr, 0, this->deterministic, 0, 0);
+                    cudaCheckError();
+            }
+        }
+        else
+        {
+            findStrongestNeighbourBlockDiaCsr_NoMerge <<< num_blocks, threads_per_block, 0, stream>>>(A_row_offsets_ptr, A_column_indices_ptr, edge_weights_ptr, num_block_rows, partner_index_ptr, strongest_neighbour_ptr, this->deterministic);
+        }
+
+        cudaCheckError();
+        // Look for perfect matches
+        numUnassigned_previous = numUnassigned;
+
+        if (avoid_thrust_count == 0)
+        {
+            matchEdges <<< num_blocks, threads_per_block, 0, stream>>>(num_block_rows, partner_index_ptr, aggregates_ptr, strongest_neighbour_ptr);
+            cudaCheckError();
+            numUnassigned = (int)thrust_wrapper::count<AMGX_device>(partner_index.begin(), partner_index.begin() + num_block_rows, -1);
+            cudaCheckError();
+        }
+        else
+        {
+            my_MatchEdges <<< num_blocks_1024, 1024, 0, stream>>>(num_block_rows, partner_index_ptr, aggregates_ptr, strongest_neighbour_ptr, sets_per_block);
+            cudaCheckError();
+            numUnassigned = numUnassigned_previous - amgx::strided_reduction::count_block_results_pinned_memory(0, icount, num_blocks_1024, sets_per_block, amgx::strided_reduction::op_sum(), stream);
+        }
+
+        icount++;
+    }
+    while (!(numUnassigned == 0 || icount > this->max_iterations || 1.0 * numUnassigned / num_block_rows < this->numUnassigned_tol || numUnassigned_previous == numUnassigned));
+
+    assignUnassignedVertices <<< num_blocks, threads_per_block, 0, stream>>>(partner_index_ptr, num_block_rows);
+    cudaCheckError();
+    // -------------------------------------------------
+    // Merge aggregates to create aggregates of size 4
+    // -------------------------------------------------
+    Vector<TemplateConfig<AMGX_device, AMGX_vecFloat, t_matPrec, t_indPrec> > weight_strongest_neighbour(num_block_rows, -1);
+    float *weight_strongest_neighbour_ptr = weight_strongest_neighbour.raw();
+    // At this point, partner index contain either your index or your neighbours index, depending on weither you're matched or not
+    // aggregates contain the largest vertex index of vertices in aggregate
+    typename Matrix_d::IVector aggregated(num_block_rows, -1);
+    IndexType *aggregated_ptr = aggregated.raw();
+    // now used as flag to check if aggregated or not
+    icount = 0;
+    numUnassigned = num_block_rows;
+    numUnassigned_previous = numUnassigned;
+
+    do
+    {
+        // Each vertex stores in strongest_neighbour the aggregates number of strongest neighbour and the weight of connection
+        if (newFindStrongest)
+        {
+            if (numUnassigned == num_block_rows && usenumassignedassumption)
+            {
+                cudaFuncSetCacheConfig(my_findStrongestNeighbourBlockDiaCsr_NoMerge<AVG_NNZ, ALGORITHM_STOREWEIGHTS, 1, 0, int>, cudaFuncCachePreferL1);
+                my_findStrongestNeighbourBlockDiaCsr_NoMerge<AVG_NNZ, ALGORITHM_STOREWEIGHTS, 1, 0, int> <<< num_blocks, threads_per_block, 0, stream>>>(A_row_offsets_ptr, A_column_indices_ptr, edge_weights_ptr, num_block_rows, num_nonzero_blocks, aggregated_ptr, aggregates_ptr, strongest_neighbour_ptr, partner_index_ptr, weight_strongest_neighbour_ptr, this->deterministic, 0, 0);
+                cudaCheckError();
+            }
+            else
+            {
+                cudaFuncSetCacheConfig(my_findStrongestNeighbourBlockDiaCsr_NoMerge<AVG_NNZ, ALGORITHM_STOREWEIGHTS, 0, 0, int>, cudaFuncCachePreferL1);
+                my_findStrongestNeighbourBlockDiaCsr_NoMerge<AVG_NNZ, ALGORITHM_STOREWEIGHTS, 0, 0, int> <<< num_blocks, threads_per_block, 0, stream>>>(A_row_offsets_ptr, A_column_indices_ptr, edge_weights_ptr, num_block_rows, num_nonzero_blocks,  aggregated_ptr, aggregates_ptr, strongest_neighbour_ptr, partner_index_ptr, weight_strongest_neighbour_ptr, this->deterministic, 0, 0);
+                cudaCheckError();
+            }
+        }
+        else
+        {
+            findStrongestNeighbourBlockDiaCsr_StoreWeight <<< num_blocks, threads_per_block, 0, stream>>>(A_row_offsets_ptr, A_column_indices_ptr, edge_weights_ptr, num_block_rows, aggregated_ptr, aggregates_ptr, strongest_neighbour_ptr, partner_index_ptr, weight_strongest_neighbour_ptr, this->deterministic);
+        }
+
+        cudaCheckError();
+        // Each vertex in same aggregates will agree on aggregates to propose too, and both store the aggregate number they want to match with
+        agreeOnProposal <<< num_blocks, threads_per_block, 0, stream>>>(A_row_offsets_ptr, A_column_indices_ptr, num_block_rows, aggregated_ptr, strongest_neighbour_ptr, weight_strongest_neighbour_ptr, partner_index_ptr, aggregates_ptr);
+        cudaCheckError();
+        numUnassigned_previous = numUnassigned;
+
+        if (avoid_thrust_count == 0)
+        {
+            matchAggregatesSize4 <IndexType> <<< num_blocks, threads_per_block, 0, stream>>>(aggregates_ptr, aggregated_ptr, strongest_neighbour_ptr, partner_index_ptr, num_block_rows);
+            cudaCheckError();
+            numUnassigned = thrust_wrapper::count<AMGX_device>(aggregated.begin(), aggregated.end(), -1);
+        }
+        else
+        {
+            my_matchAggregatesSize4 <<< num_blocks_1024, 1024, 0, stream>>>(aggregates_ptr, aggregated_ptr, strongest_neighbour_ptr, partner_index_ptr, num_block_rows, sets_per_block);
+            cudaCheckError();
+            numUnassigned = numUnassigned_previous - amgx::strided_reduction::count_block_results_pinned_memory(1, icount, num_blocks_1024, sets_per_block, amgx::strided_reduction::op_sum(), stream);
+        }
+
+        cudaCheckError();
+        icount++;
+    }
+    while (!(numUnassigned == 0 || icount > this->max_iterations || 1.0 * numUnassigned / num_block_rows < this->numUnassigned_tol || numUnassigned == numUnassigned_previous) );
+
+    assignUnassignedVertices_2 <<< num_blocks, threads_per_block, 0, stream>>>(partner_index_ptr, num_block_rows);
+    cudaCheckError();
+    // -------------------------------------------------
+    // Merge aggregates to create aggregates of size 8
+    // -------------------------------------------------
+    thrust_wrapper::fill<AMGX_device>(aggregated.begin(), aggregated.end(), -1);
+    cudaCheckError();
+    thrust_wrapper::fill<AMGX_device>(weight_strongest_neighbour.begin(), weight_strongest_neighbour.end(), -1.);
+    cudaCheckError();
+    icount = 0;
+    numUnassigned = num_block_rows;
+    numUnassigned_previous = numUnassigned;
+
+    do
+    {
+        // Each vertex stores in strongest_neighbour the aggregates number of strongest neighbour and the weight of connection
+        if (newFindStrongest)
+        {
+            if (numUnassigned == num_block_rows && usenumassignedassumption)
+            {
+                cudaFuncSetCacheConfig(my_findStrongestNeighbourBlockDiaCsr_NoMerge<AVG_NNZ, ALGORITHM_STOREWEIGHTS_2, 1, 0, int>, cudaFuncCachePreferL1);
+                my_findStrongestNeighbourBlockDiaCsr_NoMerge<AVG_NNZ, ALGORITHM_STOREWEIGHTS_2, 1, 0, int> <<< num_blocks, threads_per_block, 0, stream>>>(A_row_offsets_ptr, A_column_indices_ptr, edge_weights_ptr, num_block_rows, num_nonzero_blocks,  aggregated_ptr, aggregates_ptr, strongest_neighbour_ptr, partner_index_ptr, weight_strongest_neighbour_ptr, this->deterministic, 0, 0);
+                cudaCheckError();
+            }
+            else
+            {
+                cudaFuncSetCacheConfig(my_findStrongestNeighbourBlockDiaCsr_NoMerge<AVG_NNZ, ALGORITHM_STOREWEIGHTS_2, 0, 0, int>, cudaFuncCachePreferL1);
+                my_findStrongestNeighbourBlockDiaCsr_NoMerge<AVG_NNZ, ALGORITHM_STOREWEIGHTS_2, 0, 0, int> <<< num_blocks, threads_per_block, 0, stream>>>(A_row_offsets_ptr, A_column_indices_ptr, edge_weights_ptr, num_block_rows, num_nonzero_blocks, aggregated_ptr, aggregates_ptr, strongest_neighbour_ptr, partner_index_ptr, weight_strongest_neighbour_ptr, this->deterministic, 0, 0);
+                cudaCheckError();
+            }
+        }
+        else
+        {
+            findStrongestNeighbourBlockDiaCsr_StoreWeight_2 <<< num_blocks, threads_per_block, 0, stream>>>(A_row_offsets_ptr, A_column_indices_ptr, edge_weights_ptr, num_block_rows, aggregated_ptr, aggregates_ptr, strongest_neighbour_ptr, partner_index_ptr, weight_strongest_neighbour_ptr);
+        }
+
+        cudaCheckError();
+
+        // Each vertex in same aggregates will agree on aggregates to propose too, and both store the aggregate number they want to match with
+        if (!this->deterministic)
+        {
+            agreeOnProposal_2 <<< num_blocks, threads_per_block, 0, stream>>>(A_row_offsets_ptr, A_column_indices_ptr, num_block_rows, aggregated_ptr, strongest_neighbour_ptr, weight_strongest_neighbour_ptr, partner_index_ptr, aggregates_ptr, this->deterministic);
+            cudaCheckError();
+        }
+        else
+        {
+            //strongest_neighbour_tmp = strongest_neighbour; // copied that directly in the kernel
+            agreeOnProposal_2_deterministic <<< num_blocks, threads_per_block, 0, stream>>>(
+                strongest_neighbour_tmp.raw(),
+                A_row_offsets_ptr,
+                A_column_indices_ptr, num_block_rows,
+                aggregated_ptr, strongest_neighbour_ptr,
+                weight_strongest_neighbour_ptr, partner_index_ptr, aggregates_ptr, this->deterministic);
+                cudaCheckError();
+            strongest_neighbour_tmp.swap(strongest_neighbour);
+            strongest_neighbour_ptr = strongest_neighbour.raw(); //re-saving the correct pointer..
+        }
+
+        cudaCheckError();
+        numUnassigned_previous = numUnassigned;
+
+        if (avoid_thrust_count == 0)
+        {
+            matchAggregates <IndexType> <<< num_blocks, threads_per_block, 0, stream>>>(aggregates_ptr, aggregated_ptr, strongest_neighbour_ptr, num_block_rows);
+            cudaCheckError();
+            numUnassigned = thrust_wrapper::count<AMGX_device>(aggregated.begin(), aggregated.end(), -1);
+        }
+        else
+        {
+            my_matchAggregates <<< num_blocks_1024, 1024, 0, stream>>>(aggregates_ptr, aggregated_ptr, strongest_neighbour_ptr, num_block_rows, sets_per_block);
+            cudaCheckError();
+            numUnassigned = numUnassigned_previous - amgx::strided_reduction::count_block_results_pinned_memory(2, icount, num_blocks_1024, sets_per_block, amgx::strided_reduction::op_sum(), stream);
+        }
+
+        cudaCheckError();
+        icount++;
+    }
+    while (!(numUnassigned == 0 || icount > this->max_iterations || 1.0 * numUnassigned / num_block_rows < this->numUnassigned_tol || numUnassigned_previous == numUnassigned) );
+
+    // Merge remaining vertices with current aggregates
+    int local_iter = 0;
+
+    if (!this->deterministic)
+    {
+        while (numUnassigned != 0)
+        {
+            mergeWithExistingAggregatesBlockDiaCsr <<< num_blocks, threads_per_block, 0, stream>>>(A_row_offsets_ptr, A_column_indices_ptr, edge_weights_ptr, num_block_rows, aggregates_ptr, aggregated_ptr, this->deterministic, (IndexType *) NULL, local_iter > 1);
+            cudaCheckError();
+            numUnassigned_previous = numUnassigned;
+            numUnassigned = (int)thrust_wrapper::count<AMGX_device>(aggregated.begin(), aggregated.end(), -1);
+            cudaCheckError();
+            local_iter++;
+        }
+    }
+    else
+    {
+        typename Matrix_d::IVector aggregates_candidate(num_block_rows, -1);
+
+        while (numUnassigned != 0)
+        {
+            // allow singletons only from the 2nd local iteration
+            mergeWithExistingAggregatesBlockDiaCsr <<< num_blocks, threads_per_block, 0, stream>>>(A_row_offsets_ptr, A_column_indices_ptr, edge_weights_ptr, num_block_rows, aggregates_ptr, aggregated_ptr, this->deterministic, aggregates_candidate.raw(), local_iter > 1);
+            cudaCheckError();
+            numUnassigned_previous = numUnassigned;
+
+            if (avoid_thrust_count == 0)
+            {
+                joinExistingAggregates <<< num_blocks, threads_per_block, 0, stream>>>(num_block_rows, aggregates_ptr, aggregated_ptr, aggregates_candidate.raw());
+                cudaCheckError();
+                numUnassigned = (int)thrust_wrapper::count<AMGX_device>(aggregated.begin(), aggregated.end(), -1);
+            }
+            else
+            {
+                my_joinExistingAggregates <<< num_blocks_1024, 1024, 0, stream>>>(num_block_rows, aggregates_ptr, aggregated_ptr, aggregates_candidate.raw(), sets_per_block);
+                cudaCheckError();
+                numUnassigned = numUnassigned_previous - amgx::strided_reduction::count_block_results_pinned_memory(3, local_iter, num_blocks_1024, sets_per_block, amgx::strided_reduction::op_sum(), stream);
+            }
+
+            cudaCheckError();
+            local_iter++;
+        }
+
+        aggregates_candidate.resize(0);
+    }
+
+    this->renumberAndCountAggregates(aggregates, aggregates_global, num_block_rows, num_aggregates);
+    //analyze_coloring(aggregates, A.getMatrixColoring().getRowColors());
+}
+
+template <class T_Config>
+void Size8SelectorBase<T_Config>::setAggregates(Matrix<T_Config> &A,
+        IVector &aggregates, IVector &aggregates_global, int &num_aggregates)
+{
+    if (A.get_block_dimx() == A.get_block_dimy())
+    {
+        setAggregates_common_sqblock( A, aggregates, aggregates_global, num_aggregates );
+    }
+    else
+    {
+        FatalError("Unsupported block size for Size8Selector", AMGX_ERR_NOT_SUPPORTED_BLOCKSIZE);
+    }
+}
+
+// -------------------------
+//  Explict instantiations
+// -------------------------
+#define AMGX_CASE_LINE(CASE) template class Size8SelectorBase<TemplateMode<CASE>::Type>;
+AMGX_FORALL_BUILDS(AMGX_CASE_LINE)
+AMGX_FORCOMPLEX_BUILDS(AMGX_CASE_LINE)
+#undef AMGX_CASE_LINE
+#define AMGX_CASE_LINE(CASE) template class Size8Selector<TemplateMode<CASE>::Type>;
+AMGX_FORALL_BUILDS(AMGX_CASE_LINE)
+AMGX_FORCOMPLEX_BUILDS(AMGX_CASE_LINE)
+#undef AMGX_CASE_LINE
+}
+}
+}

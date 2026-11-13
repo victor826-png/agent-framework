@@ -1,0 +1,771 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+import random
+import math
+import torch
+from typing import Any, List, Optional
+import cudnn
+
+from dataclasses import dataclass, field, asdict
+
+# fmt: off
+
+def generate_test_seeds(*, num_tests, rng_seed):
+    # Env overrides for focused/expanded sweeps without editing each suite:
+    #   MHAS_NUM_TESTS   - cap (or expand) the number of configs (e.g. small subset for sanitizer runs)
+    #   MHAS_SEED_OFFSET - shift the geometry RNG seed to explore a fresh set of configs
+    import os
+    rng_seed = rng_seed + int(os.environ.get("MHAS_SEED_OFFSET", "0"))
+    n = int(os.environ.get("MHAS_NUM_TESTS", "0")) or num_tests
+    rng = random.Random(rng_seed)
+    return [(i+1, n, rng.randint(65536, 2147483647)) for i in range(n)]
+
+
+def get_strides_from_indices(shape, indices=[0, 1, 2, 3], gaps=[0, 0, 0, 0], rng_geom=None):
+    """Compute strides for a given dimension order and optional gaps."""
+    assert len(shape) == len(gaps) == 4 and sorted(indices) == [0, 1, 2, 3] and indices[3] == 3, "wrong input"
+    strides = [0, 0, 0, 1]  # d should always have stride 1
+    curr_stride = 1
+
+    for i in range(3, 0, -1):
+        j = indices[i]
+        curr_stride = (shape[j] + gaps[j]) * curr_stride
+        j = indices[i - 1]
+        strides[j] = curr_stride
+
+        # Corrupt strides upwards intentionally for dim=1.
+        if rng_geom is not None and shape[j] == 1:
+            strides[j] = max(strides[j], rng_geom.choice([0, 3331333, 99990001]))
+
+    return tuple(strides)
+
+
+def packed_token_capacity(seq_lens):
+    """Token capacity of a packed (ragged) buffer: total tokens rounded up to the
+    next multiple of 64, always strictly greater than the total. The surplus
+    guarantees every ragged buffer has a capacity tail past the last ragged
+    offset — the harnesses NaN-poison that tail so an engine that reads it
+    (e.g. binding K/V views to capacity instead of live token counts,
+    GitHub #624) fails deterministically instead of only on recycled memory."""
+    return (sum(seq_lens) // 64 + 1) * 64
+
+
+def get_strides_from_layout(shape, layout, gaps=[0, 0, 0, 0], rng_geom=None):
+    """Compute strides for a given layout string (e.g. 'bshd', 'bhsd')."""
+    assert "".join(sorted(layout)) == "bdhs", f"wrong layout '{layout}'"
+    indices = ["bhsd".index(ch) for ch in layout]
+    return get_strides_from_indices(shape, indices, gaps, rng_geom)
+
+
+def compute_default_BHSD_strides(shape):
+    """Compute default BHSD strides (rightmost dim is innermost with stride=1, no gaps)."""
+    if shape is None:
+        return None
+    strides = [1] * len(shape)
+    for i in range(len(shape) - 2, -1, -1):
+        strides[i] = strides[i + 1] * shape[i + 1]
+    return tuple(strides)
+
+
+def compute_packed_strides(shape, token_gap=0, head_gap=0):
+    """Compute packed (ragged) BSHD strides for BHSD shape: (s*h*d, d, h*d, 1).
+
+    ``token_gap`` widens the token stride to ``h*d + token_gap`` elements —
+    the layout of a tensor VIEW into a larger per-token record. With
+    ``token_gap == h*d`` this is exactly a K or V view of a kv-interleaved
+    ``[T, 2, H, D]`` buffer (token stride ``2*h*d``), the layout
+    ``torch.nn.attention.varlen`` users produce by slicing a fused KV
+    projection. ``head_gap`` widens the head stride to ``d + head_gap``; the
+    token record then spans ``h * (d + head_gap) + token_gap``."""
+    if shape is None:
+        return None
+    _, h, s, d = shape
+    head_stride = d + head_gap
+    token_stride = h * head_stride + token_gap
+    return (s * token_stride, head_stride, token_stride, 1)
+
+
+@dataclass
+class ExecConfig:
+    # Registry for enum-like fields: field_name -> module/class to getattr from
+    _ENUM_FIELDS = {
+        'data_type': torch,
+        'output_type': torch,
+        'diag_align': cudnn.diagonal_alignment,
+        'implementation': cudnn.attention_implementation,
+    }
+
+    data_type: torch.dtype = None
+    output_type: torch.dtype = None
+    rng_geom_seed: int = None
+    rng_data_seed: int = None
+
+    is_alibi: bool = None
+    is_infer: bool = True
+    is_paged: bool = False
+    is_bias: bool = None
+    is_block_mask: bool = None
+    is_padding: bool = None
+    # When True, supply per-batch sequence lengths via cu_seq_len_q/cu_seq_len_kv
+    # (cumulative sequence-length tensors of shape (b+1, 1, 1, 1)) instead of
+    # the regular per-batch seq_len_q/seq_len_kv tensors. Implies is_padding=True.
+    is_cu_seq_len: bool = None
+    # Which sides use the cumulative form when is_cu_seq_len is True: "both"
+    # (default), "q" (cu_seq_len_q with seq_len_kv), or "kv" (seq_len_q with
+    # cu_seq_len_kv). The mixed forms require cuDNN 9.25+.
+    cu_seq_len_sides: str = "both"
+    is_ragged: bool = None
+    # "token_major" ([t, h, 1], sequence stride h_q) or "head_major" ([h, t], sequence stride 1).
+    # None when not ragged.
+    ragged_stats_layout: str = None
+    is_dropout: bool = None
+    is_determin: bool = None
+    is_mxfp8: bool = False
+    # FP8 / MXFP8 forward only: block-scaled O epilogue (the sdpa_fp8 / sdpa_mxfp8
+    # sf_o output). 0 = plain O, 16 = FP4_E2M1 O + E4M3 scale per 16 d, 32 =
+    # FP8_E4M3 O + UE8M0 scale per 32 d. Applied only where the FROST d128
+    # epilogue serves the config (dense, d_qk = d_v = 128); exec_sdpa_fp8 /
+    # exec_sdpa_mxfp8 fold it to 0 otherwise.
+    o_block_scale: int = 0
+
+    with_score_max: bool = False
+    with_score_sum_exp: bool = False
+    with_sink_token: bool = False
+    with_unfuse_fma: bool = False
+    # Forward writes base-2 stats (sdpa(stats_use_log2=True)); the harness restores the
+    # natural-log form before the backward, which consumes natural-log stats only.
+    with_stats_log2: bool = False
+    with_rope: bool = False
+    with_ragged_offset_multiplier: bool = False
+    # Each ragged tensor (Q/K/V/O and gradients) independently draws a token
+    # stride of 1-4 whole tokens (gap = n*h*d, n in 0..3, seeded from
+    # rng_geom_seed): n=0 is the plain packed case, n=1 is exactly a view of
+    # an interleaved [T, 2, H, D] buffer (the layout
+    # torch.nn.attention.varlen users produce by slicing a fused KV
+    # projection), n=2 a [T, 3, H, D] QKV-interleave, and so on. Whole-token
+    # gaps keep every ragged base address in the packed layout's alignment
+    # class by construction (sub-token gaps can violate the graph API's
+    # 16-byte pointer-alignment contract — an odd-element gap is illegal for
+    # every engine). Default True: every ragged config fuzzes its layouts.
+    # fill_derived_fields auto-falls-back to packed where a gap is not yet
+    # expressible or handled: cu / offset-multiplier forms (#538) and the
+    # fp8/mxfp8 harnesses (#537). Configs with explicit strides are
+    # unaffected (the gap only fills strides left None).
+    with_ragged_token_gap: bool = True
+    # Sibling of the above for the HEAD axis (stride[1] != d, e.g. head-interleaved
+    # buffers): each ragged tensor independently widens its head stride by 0-3
+    # units of 16 bytes, only where d itself is 16-byte granular so every head base
+    # keeps the packed layout's alignment class. Drawn after the token gaps from the
+    # same RNG, so existing seeds keep their token layouts.
+    with_ragged_head_gap: bool = True
+    # Packed (THD) token capacities, first-class: buffer allocation sizes the
+    # packed Q/O and K/V buffers from these (not a locally recomputed
+    # sum-of-seq-lens), knobs may fuzz slack capacity beyond the packed
+    # minimum, and when declare_total_seq_len is True they are declared on
+    # the graph via sdpa(max_total_seq_len_q/kv=...). None -> derived as
+    # packed_token_capacity(seq_len_*) in fill_derived_fields.
+    total_q: int = None
+    total_kv: int = None
+    # Declare total_q/total_kv on the forward graph (max_total_seq_len_q/kv).
+    # The backward graph always declares them (it must size dq_acc).
+    declare_total_seq_len: bool = False
+    rescale_threshold: float = None
+
+    diag_align: cudnn.diagonal_alignment = None
+    left_bound: int = None
+    right_bound: int = None
+
+    batches: int = None
+    d_qk: int = None
+    d_v: int = None
+    s_q: int = None
+    s_kv: int = None
+    h_q: int = None
+    h_k: int = None
+    h_v: int = None
+    block_size: int = None
+
+    # in_layout    : str = None
+    # out_layout   : str = None
+
+    shape_q: tuple[int, int, int, int] = None
+    stride_q: tuple[int, int, int, int] = None
+
+    shape_k: tuple[int, int, int, int] = None
+    stride_k: tuple[int, int, int, int] = None
+
+    shape_v: tuple[int, int, int, int] = None
+    stride_v: tuple[int, int, int, int] = None
+
+    shape_o: tuple[int, int, int, int] = None
+    stride_o: tuple[int, int, int, int] = None
+
+    shape_stats: tuple[int, int, int, int] = None
+    stride_stats: tuple[int, int, int, int] = None
+
+    seq_len_q: list[int] = field(default_factory=list)
+    seq_len_kv: list[int] = field(default_factory=list)
+
+    dropout_prob: float = 0.0
+
+    implementation: cudnn.attention_implementation = cudnn.attention_implementation.AUTO
+
+    @property
+    def is_train(self):
+        return not self.is_infer
+
+    def is_cu_seq_len_q(self):
+        return bool(self.is_cu_seq_len) and self.cu_seq_len_sides in ("both", "q")
+
+    def is_cu_seq_len_kv(self):
+        return bool(self.is_cu_seq_len) and self.cu_seq_len_sides in ("both", "kv")
+
+    def fill_derived_fields(self):
+        """
+        Fill in derived fields (shapes, strides) from basic dims.
+        - Shapes are computed from basic dims (batches, h_q/k/v, s_q/kv, d_qk/v)
+        - Strides default to BHSD layout if not provided
+        """
+        # Compute shapes from basic dims if not provided
+        if self.shape_q is None and all(x is not None for x in [self.batches, self.h_q, self.s_q, self.d_qk]):
+            self.shape_q = (self.batches, self.h_q, self.s_q, self.d_qk)
+        if self.shape_k is None and all(x is not None for x in [self.batches, self.h_k, self.s_kv, self.d_qk]):
+            self.shape_k = (self.batches, self.h_k, self.s_kv, self.d_qk)
+        if self.shape_v is None and all(x is not None for x in [self.batches, self.h_v, self.s_kv, self.d_v]):
+            self.shape_v = (self.batches, self.h_v, self.s_kv, self.d_v)
+        if self.shape_o is None and all(x is not None for x in [self.batches, self.h_q, self.s_q, self.d_v]):
+            self.shape_o = (self.batches, self.h_q, self.s_q, self.d_v)
+        if self.shape_stats is None and all(x is not None for x in [self.batches, self.h_q, self.s_q]):
+            self.shape_stats = (self.batches, self.h_q, self.s_q, 1)
+
+        # Packed token capacities: default to the minimal packed capacity of
+        # the drawn seq_lens (sum rounded up to 64). Explicit totals (e.g. a
+        # slack-capacity fuzz) must cover the packed payload.
+        if self.is_ragged:
+            seq_len_q = self.seq_len_q or [self.s_q] * (self.batches or 1)
+            seq_len_kv = self.seq_len_kv or [self.s_kv] * (self.batches or 1)
+            if self.total_q is None:
+                self.total_q = packed_token_capacity(seq_len_q)
+            if self.total_kv is None:
+                self.total_kv = packed_token_capacity(seq_len_kv)
+            assert self.total_q >= sum(seq_len_q), f"total_q={self.total_q} < sum(seq_len_q)"
+            assert self.total_kv >= sum(seq_len_kv), f"total_kv={self.total_kv} < sum(seq_len_kv)"
+
+        # Compute strides if not provided (packed for ragged, default BHSD otherwise).
+        # with_ragged_token_gap (default True): per-tensor token-stride gaps,
+        # re-derived deterministically from rng_geom_seed (so
+        # serialize/deserialize repro reproduces the same strides). Auto-packed
+        # where a gap is not yet expressible or handled:
+        #  - cu / offset-multiplier forms bind offsets as cu (x multiplier)
+        #    and cannot declare a token gap (#538);
+        #  - the fp8/mxfp8 harnesses (1-byte data_type) allocate assuming
+        #    packed strides (#537).
+        _gap_applicable = (
+            self.is_ragged
+            and (self.with_ragged_token_gap or self.with_ragged_head_gap)
+            and not self.is_cu_seq_len
+            and not self.with_ragged_offset_multiplier
+            and not (self.data_type is not None and self.data_type.itemsize == 1)
+        )
+        if _gap_applicable:
+            _gap_rng = random.Random((self.rng_geom_seed or 0) ^ 0xA80517)
+            # Draw ALL gaps up front, in fixed Q/K/V/O order: an
+            # explicitly provided stride must not shift the gaps the
+            # remaining tensors get (same rng_geom_seed -> same per-tensor
+            # layouts regardless of which strides were overridden).
+            _token_gaps = {name: _gap_rng.randint(0, 3) for name in ("q", "k", "v", "o")}
+            _head_gaps = {name: _gap_rng.randint(0, 3) for name in ("q", "k", "v", "o")}
+            _head_gap_quantum = 16 // (self.data_type.itemsize if self.data_type is not None else 2)
+
+            def _make_gap_fn(token_gap_units, head_gap_units):
+                def _gapped(shape):
+                    if shape is None:
+                        return None
+                    h, d = shape[1], shape[3]
+                    token_gap = token_gap_units * h * d if self.with_ragged_token_gap else 0
+                    head_gap = head_gap_units * _head_gap_quantum if self.with_ragged_head_gap and d % _head_gap_quantum == 0 else 0
+                    return compute_packed_strides(shape, token_gap, head_gap)
+
+                return _gapped
+
+            gap_q, gap_k, gap_v, gap_o = (_make_gap_fn(_token_gaps[n], _head_gaps[n]) for n in ("q", "k", "v", "o"))
+        elif self.is_ragged:
+            gap_q = gap_k = gap_v = gap_o = compute_packed_strides
+        else:
+            gap_q = gap_k = gap_v = gap_o = compute_default_BHSD_strides
+        stride_fn = compute_packed_strides if self.is_ragged else compute_default_BHSD_strides
+        if self.stride_q is None and self.shape_q is not None:
+            self.stride_q = gap_q(self.shape_q)
+        if self.stride_k is None and self.shape_k is not None:
+            self.stride_k = gap_k(self.shape_k)
+        if self.stride_v is None and self.shape_v is not None:
+            self.stride_v = gap_v(self.shape_v)
+        if self.stride_o is None and self.shape_o is not None:
+            self.stride_o = gap_o(self.shape_o)
+        # stats keeps the packed default — its layout is fuzzed separately
+        # via ragged_stats_layout.
+        if self.stride_stats is None and self.shape_stats is not None:
+            self.stride_stats = stride_fn(self.shape_stats)
+
+    def serialize(self) -> dict:
+        """Convert config to a serializable dict for repro commands."""
+        cfg_dict = asdict(self)
+        for field, enum_cls in self._ENUM_FIELDS.items():
+            if cfg_dict.get(field) is not None:
+                val = cfg_dict[field]
+                if hasattr(val, 'name'):
+                    module_prefix = enum_cls.__module__.split('.')[0]
+                    cfg_dict[field] = f"{module_prefix}.{enum_cls.__name__}.{val.name}"
+                else:
+                    cfg_dict[field] = str(val)
+        return cfg_dict
+
+    @classmethod
+    def deserialize(cls, d: dict) -> "ExecConfig":
+        """Create ExecConfig from a serialized dict."""
+        for field, enum_cls in cls._ENUM_FIELDS.items():
+            if d.get(field) is not None:
+                name = d[field].split('.')[-1]
+                assert hasattr(enum_cls, name), f"Invalid {field}: {name}"
+                d[field] = getattr(enum_cls, name)
+        cfg = cls(**d)
+        cfg.fill_derived_fields()
+        return cfg
+
+    def to_repro_cmd(self, test_file: str) -> str:
+        """Generate a readable multi-line repro command with aligned backslashes."""
+        cfg_dict = self.serialize()
+        indent = " " * 4
+        # Build lines without trailing backslash first
+        lines = [
+            "pytest -vv -s -rA --no-header --tb=short",
+            f"{indent}{test_file}::test_repro",
+            f"{indent}--repro \"",
+            f"{indent}{indent}" + "{",
+        ]
+        items = list(cfg_dict.items())
+        for i, (k, v) in enumerate(items):
+            comma = "," if i < len(items) - 1 else ""
+            lines.append(f"{indent}{indent}{indent}'{k}': {repr(v)}{comma}")
+        lines.append(f"{indent}{indent}" + "}")
+        lines.append(f'{indent}"')
+        # Find max length and align backslashes (except last line)
+        max_len = max(len(line) for line in lines[:-1])
+        aligned = [f"{line:<{max_len}} \\" for line in lines[:-1]]
+        aligned.append(lines[-1])
+        return "\n".join(aligned)
+
+
+class RandomizationContext:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        pass
+
+    def __call__(self, rng, rng_data_seed, rng_geom_seed=None):
+
+        randoms_ = ExecConfig()
+
+        randoms = {}
+
+        randoms_.rng_geom_seed = rng_geom_seed
+        randoms_.rng_data_seed = rng_data_seed
+
+        randoms["rng_data_seed"] = rng_data_seed
+
+        self.rng_data = torch.Generator(device="cuda").manual_seed(rng_data_seed)
+
+        randoms = {k: v(rng) for k, v in self.kwargs.items() if not hasattr(randoms_, k)}
+        [setattr(randoms_, k, v(rng)) for k, v in self.kwargs.items() if hasattr(randoms_, k)]
+
+        if "is_deterministic" in randoms:
+            randoms_.is_determin = randoms["is_deterministic"] == True
+
+        if "is_alibi" in randoms:
+            randoms_.is_alibi = randoms["is_alibi"] == True
+
+        if "is_bias" in randoms:
+            randoms_.is_bias = randoms["is_bias"] == True
+
+        randoms_.s_q, randoms_.s_kv = randoms["s_q_s_kv"]
+        randoms_.d_qk, randoms_.d_v = randoms["d_qk_d_v"]
+        randoms_.h_q, randoms_.h_k, randoms_.h_v = randoms["head_count"]
+
+        randoms_.is_ragged = randoms["is_ragged_or_padded_or_full"] in ("ragged", "cu_ragged", "ragged_mult", "cu_ragged_mult")
+        randoms_.is_padding = randoms["is_ragged_or_padded_or_full"] in ("padded", "ragged", "cu_padded", "cu_ragged", "ragged_mult", "cu_ragged_mult")
+        randoms_.is_cu_seq_len = randoms["is_ragged_or_padded_or_full"] in ("cu_padded", "cu_ragged", "cu_ragged_mult")
+        randoms_.with_ragged_offset_multiplier = randoms["is_ragged_or_padded_or_full"] in ("ragged_mult", "cu_ragged_mult")
+
+        if randoms["is_ragged_or_padded_or_full"] != "full":
+            # Per-batch lengths draw U(0, s_max) — zero is a legal length, not
+            # a special case — with an extra ~3% forced-zero boost per entry
+            # (a pure uniform would make zeros ~1/(s+1) rare and zero-length
+            # handling would go untested in practice). Q and KV draw
+            # independently.
+            randoms_.seq_len_q = [0 if rng.random() < 0.03 else rng.randint(0, randoms_.s_q) for _ in range(randoms_.batches)]
+            randoms_.seq_len_kv = [0 if rng.random() < 0.03 else rng.randint(0, randoms_.s_kv) for i in range(randoms_.batches)]
+
+        # Packed token capacities (first-class). Default is the minimal packed
+        # capacity; the optional total_token_slack knob widens capacity beyond
+        # it in whole 64-token steps — a buffer bigger than its payload, the
+        # normal shape of a reused/pooled varlen workspace.
+        if randoms_.is_ragged:
+            slack = randoms.get("total_token_slack", "packed")
+            def _capacity(seq_lens):
+                cap = packed_token_capacity(seq_lens)
+                if slack == "slack":
+                    cap += 64 * rng.randint(1, 4)
+                return cap
+            randoms_.total_q = _capacity(randoms_.seq_len_q)
+            randoms_.total_kv = _capacity(randoms_.seq_len_kv)
+
+        # Decide the left and right bounds for the sliding window mask (None = no bound)
+        randoms_.left_bound = None
+        randoms_.right_bound = None
+
+        if randoms["with_sliding_mask"] == "no_mask":
+            pass  # left_bound and right_bound stay None
+        elif randoms["with_sliding_mask"] == "left_window_only":
+            randoms_.left_bound = rng.randint(1, max(1, randoms_.s_kv // 2))
+            randoms_.right_bound = 0
+        elif randoms["with_sliding_mask"] == "right_window_only":
+            randoms_.left_bound = None if randoms_.diag_align == cudnn.diagonal_alignment.BOTTOM_RIGHT else 1
+            randoms_.right_bound = rng.randint(0, randoms_.s_kv // 2)
+        elif randoms["with_sliding_mask"] == "band_around_diag":
+            # s_kv == 1 leaves an empty randint range; a 1-wide band is the only option.
+            randoms_.left_bound = rng.randint(1, max(1, randoms_.s_kv // 2))
+            randoms_.right_bound = rng.randint(1, max(1, randoms_.s_kv // 2))
+        elif randoms["with_sliding_mask"] == "causal":
+            randoms_.right_bound = 0
+
+        elem_align = int(16 / randoms_.data_type.itemsize)
+        # Decide Q, O, Stats
+        randoms_.shape_q = (randoms_.batches, randoms_.h_q, randoms_.s_q, randoms_.d_qk)
+        randoms_.shape_o = (randoms_.batches, randoms_.h_q, randoms_.s_q, randoms_.d_v)
+        randoms_.shape_stats = (randoms_.batches, randoms_.h_q, randoms_.s_q, 1)
+
+        if randoms_.is_ragged:  # Ideally Q, O, and Stats are all ragged
+            # Q/O strides stay None: fill_derived_fields (called before
+            # return) draws the seeded per-tensor token gaps there, with the
+            # auto-packed fallbacks for the cu / offset-multiplier forms
+            # (#538) and 1-byte data types (#537). Assigning packed strides
+            # here would bypass that knob for the whole randomized fleet —
+            # exactly how the numel()//token_stride capacity bug (issue #613)
+            # stayed invisible to these sweeps.
+            if randoms_.ragged_stats_layout == "head_major":
+                # [h, t] stats: tokens contiguous within a head, heads strided by the whole packed
+                # buffer. This is FlashAttention's / PyTorch varlen's softmax_lse layout; unlike the
+                # token-major one its sequence stride is 1 instead of h_q.
+                t_q = randoms_.total_q
+                randoms_.stride_stats = (randoms_.h_q * t_q, t_q, 1, 1)
+            else:
+                randoms_.stride_stats = get_strides_from_layout(randoms_.shape_stats, "bshd")
+        else:
+            randoms_.ragged_stats_layout = None
+            indices = [0, 1, 2]
+            rng.shuffle(indices)
+            indices.append(3)
+            gaps_q = [0, 0, 0, 0]
+            gaps_o = [0, 0, 0, 0]
+            gaps_stats = [0, 0, 0, 0]
+
+            if rng.randint(0, 1) == 0:  # 50% chance of gaps
+                gaps_q = [rng.randint(0, 8) for _ in range(3)]
+                gaps_o = [rng.randint(0, 8) for _ in range(3)]
+                gaps_stats = [rng.randint(0, 8) for _ in range(3)]
+                gaps_q.append(elem_align * rng.randint(0, 2))
+                gaps_o.append(elem_align * rng.randint(0, 2))
+                gaps_stats.append(elem_align * rng.randint(0, 2))
+
+            randoms_.stride_q = get_strides_from_indices(randoms_.shape_q, indices, gaps_q, rng)
+            randoms_.stride_o = get_strides_from_indices(randoms_.shape_o, indices, gaps_o, rng)
+            randoms_.stride_stats = get_strides_from_indices(randoms_.shape_stats, indices, gaps_stats, rng)
+
+        # Decide K, V
+        randoms_.shape_k = (
+            randoms_.batches,
+            randoms_.h_k,
+            randoms_.s_kv,
+            randoms_.d_qk,
+        )
+        randoms_.shape_v = (randoms_.batches, randoms_.h_v, randoms_.s_kv, randoms_.d_v)
+
+        if randoms_.is_ragged:  # Ideally K ragged and V ragged
+            pass  # K/V strides stay None -> seeded token gaps in fill_derived_fields
+
+        else:
+            indices = [0, 1, 2]
+            rng.shuffle(indices)
+            indices.append(3)
+            gaps_k = [0, 0, 0, 0]
+            gaps_v = [0, 0, 0, 0]
+
+            if rng.randint(0, 1) == 0:  # 50% chance of gaps
+                gaps_k = [rng.randint(0, 8) for _ in range(3)]
+                gaps_v = [rng.randint(0, 8) for _ in range(3)]
+                gaps_k.append(elem_align * rng.randint(0, 2))
+                gaps_v.append(elem_align * rng.randint(0, 2))
+
+            randoms_.stride_k = get_strides_from_indices(randoms_.shape_k, indices, gaps_k, rng)
+            randoms_.stride_v = get_strides_from_indices(randoms_.shape_v, indices, gaps_v, rng)
+
+        # Fill whatever was left None (ragged Q/K/V/O strides) through the
+        # same derivation every ExecConfig takes — one source of truth for
+        # the ragged token-gap draw and its fallbacks.
+        randoms_.fill_derived_fields()
+        return randoms_
+
+
+class RandomChoice:
+    def __init__(self, choices: dict[Any, int]):
+        self.choices = choices
+        self.total_weight = sum(choices.values())
+
+    def __call__(self, rng):
+        dice = rng.randint(0, self.total_weight - 1)
+        for k, v in self.choices.items():
+            if dice < v:
+                return k
+            dice -= v
+
+
+class RandomIntValue:
+    def __init__(
+        self,
+        min: int,
+        max: int,
+        multiple_of: Optional[int] = None,
+        power_of_two: Optional[bool] = False,
+        with_high_probability: Optional[List[int]] = None,
+    ):
+        self.min = min
+        self.max = max
+        self.multiple_of = multiple_of
+        self.power_of_two = power_of_two
+        self.with_high_probability = with_high_probability
+
+    def __call__(self, rng):
+        # 50% chance to use the with_high_probability list
+        dice = rng.randint(0, 1) if self.with_high_probability is not None else 0
+        if self.power_of_two:
+            # calculate the smallest and largest powers of two in range, then sample
+            min_exp = math.ceil(math.log2(self.min))
+            max_exp = math.floor(math.log2(self.max))
+            if min_exp > max_exp:
+                raise ValueError(f"No power of two in range [{self.min}, {self.max}]")
+            exp = rng.randint(min_exp, max_exp) if dice == 0 else self.with_high_probability[rng.randint(0, len(self.with_high_probability) - 1)]
+            return 1 << exp if dice == 0 else exp
+        elif self.multiple_of:
+            # compute the first and last valid multiples, then pick randomly
+            first = ((self.min + self.multiple_of - 1) // self.multiple_of) * self.multiple_of
+            last = (self.max // self.multiple_of) * self.multiple_of
+            if first > self.max:
+                raise ValueError(f"No multiples of {self.multiple_of} in range [{self.min}, {self.max}]")
+            count = ((last - first) // self.multiple_of) + 1
+            idx = rng.randint(0, count - 1) if dice == 0 else self.with_high_probability[rng.randint(0, len(self.with_high_probability) - 1)]
+            return first + idx * self.multiple_of
+        else:
+            return rng.randint(self.min, self.max) if dice == 0 else self.with_high_probability[rng.randint(0, len(self.with_high_probability) - 1)]
+
+
+class RandomHeadGenerator:
+    def __init__(self, min: int, max: int, head_group_options: tuple[int, int, int]):
+        self.min = min
+        self.max = max
+        self.head_group_options = head_group_options
+
+    def __call__(self, rng):
+        sum_weights = sum(self.head_group_options)
+        dice = rng.randint(0, sum_weights - 1)
+        if dice < self.head_group_options[0]:  # MHA case
+            h_q = h_k = h_v = rng.randint(self.min, self.max)
+        elif dice < self.head_group_options[0] + self.head_group_options[1]:  # GQA case
+            h_q = rng.randint(self.min, self.max)
+            divisors = (lambda h: [i for i in range(1, h + 1) if h % i == 0])(h_q)
+            group_count = rng.choice(divisors)
+            h_k = h_v = h_q // group_count
+        else:
+            h_q = rng.randint(self.min, self.max)
+            h_k = 1
+            h_v = 1
+
+        return h_q, h_k, h_v
+
+
+class SlidingWindowMaskGenerator:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        pass
+
+    def __call__(self, rng):
+        sum_weights = sum(self.kwargs.values())
+        dice = rng.randint(0, sum_weights - 1)
+        for k, v in self.kwargs.items():
+            if dice < v:
+                return k
+            dice -= v
+
+
+class RandomHiddenDimSize:
+    def __init__(
+        self,
+        d_qk_min: int,
+        d_qk_max: int,
+        d_v_min: int,
+        d_v_max: int,
+        head_dim_distribution: dict[Any, int],
+        with_high_probability: Optional[List[tuple[int, int]]] = None,
+    ):
+
+        self.d_qk_gen = RandomIntValue(min=d_qk_min, max=d_qk_max, multiple_of=8)
+        self.d_v_gen = RandomIntValue(min=d_v_min, max=d_v_max, multiple_of=8)
+        self.distribution = RandomChoice(head_dim_distribution)
+        self.with_high_probability = with_high_probability
+
+    def __call__(self, rng):
+
+        dice = rng.randint(0, 1) if self.with_high_probability is not None else 0
+
+        if dice == 0:
+            d_qk = self.d_qk_gen(rng)
+            d_v = self.d_v_gen(rng)
+            distribution = self.distribution(rng)
+
+            if distribution == "d_qk=d_v":
+                d_v = d_qk
+
+            if d_qk < d_v:
+                d_qk = d_v
+        else:
+            d_qk, d_v = self.with_high_probability[rng.randint(0, len(self.with_high_probability) - 1)]
+
+        return d_qk, d_v
+
+
+class RandomSequenceLength:
+    def __init__(
+        self,
+        s_q_min: int,
+        s_q_max: int,
+        s_kv_min: int,
+        s_kv_max: int,
+        s_q_distribution: dict[Any, int],
+    ):
+        # Cap sequence lengths at 1024 on SM80 (Ampere) and on small-memory GPUs
+        # to avoid OOMs for CI/CD. A 4k bwd config holds >12 GiB, which starves
+        # sibling pytest-xdist workers on e.g. the 16 GiB RTX 5080 sm120 runner;
+        # the cap keys on device memory, not arch, so big Blackwells stay at 4k.
+        if torch.cuda.is_available() and (
+            torch.cuda.get_device_capability()[0] == 8 or torch.cuda.get_device_properties(0).total_memory < 20 * 2**30
+        ):
+            s_q_max = min(s_q_max, 1024)
+            s_kv_max = min(s_kv_max, 1024)
+            s_q_min = min(s_q_min, s_q_max)
+            s_kv_min = min(s_kv_min, s_kv_max)
+        self.s_q_gen = RandomIntValue(min=s_q_min, max=s_q_max)
+        self.s_kv_gen = RandomIntValue(min=s_kv_min, max=s_kv_max)
+        self._s_q_max = s_q_max  # post-cap upper bound, used to clamp the s_q>s_kv branch
+        self.distribution = RandomChoice(s_q_distribution)
+
+    def __call__(self, rng):
+        s_q = self.s_q_gen(rng)
+        s_kv = self.s_kv_gen(rng)
+
+        distribution = self.distribution(rng)
+
+        if distribution == "s_q=1":
+            s_q = 1
+        elif distribution == "s_q=s_kv":
+            s_q = s_kv
+        elif distribution == "s_q>s_kv":
+            # Query longer than key/value (cross-attention, chunked prefill).
+            # The default "s_q=random" branch below structurally caps s_q<=s_kv, so
+            # this regime is otherwise never exercised. Caught class: NVBug 5829882
+            # (SDPA hang when S_Q > S_KV).
+            # Clamp to s_q_max so we don't overshoot the suite bound (esp. the SM80
+            # OOM cap) and trigger spurious torch CUDA OOM instead of testing cuDNN.
+            if s_kv < self._s_q_max:
+                s_q = min(s_kv + rng.randint(1, max(1, s_kv)), self._s_q_max)
+            # else: s_kv already at the cap -> no room for s_q>s_kv within bounds; leave s_q.
+        else:
+            s_q = self.s_q_gen(rng)
+
+            # Always s_q <=s_kv
+            if s_q > s_kv:
+                s_q = s_kv
+        return s_q, s_kv
+
+
+class RandomBatchSize(RandomIntValue):
+    def __init__(self, min: int, max: int, with_high_probability: Optional[List[int]] = None):
+        super().__init__(min, max, with_high_probability=with_high_probability)
+
+    def __call__(self, rng):
+        return super().__call__(rng)
+
+
+class RandomBlockSize(RandomIntValue):
+    def __init__(self, min: int, max: int, with_high_probability: Optional[List[int]] = None):
+        super().__init__(min, max, with_high_probability=with_high_probability, power_of_two=True)
+
+    def __call__(self, rng):
+        return super().__call__(rng)
+
+
+def test_randomization_context(seed):
+    with RandomizationContext(
+        batches=RandomBatchSize(min=1, max=8, with_high_probability=[1, 4]),
+        s_q_s_kv=RandomSequenceLength(
+            s_q_min=1,
+            s_q_max=1024,
+            s_kv_min=1,
+            s_kv_max=512,
+            s_q_distribution={"s_q=1": 0, "s_q=s_kv": 5, "s_q=random": 10},
+        ),
+        d_qk_d_v=RandomHiddenDimSize(
+            d_qk_min=1,
+            d_qk_max=128,
+            d_v_min=1,
+            d_v_max=128,
+            head_dim_distribution={"d_qk=d_v": 1, "d_qk=random": 1},
+            with_high_probability=[(128, 128), (192, 128)],
+        ),
+        head_count=RandomHeadGenerator(min=1, max=8, head_group_options=(1, 4, 1)),
+        data_type=RandomChoice({torch.float16: 1, torch.bfloat16: 2}),
+        with_sliding_mask=SlidingWindowMaskGenerator(
+            causal=10,
+            left_window_only=5,
+            right_window_only=5,
+            band_around_diag=10,
+            no_mask=10,
+        ),
+        diag_align=RandomChoice(
+            {
+                cudnn.diagonal_alignment.TOP_LEFT: 1,
+                cudnn.diagonal_alignment.BOTTOM_RIGHT: 1,
+            }
+        ),
+        is_ragged_or_padded_or_full=RandomChoice({"ragged": 1, "padded": 1, "full": 1}),
+        ragged_stats_layout=RandomChoice({"token_major": 1, "head_major": 1}),
+    ) as ctx:
+        return ctx
+
+
+if __name__ == "__main__":
+    num_tests = 10
+    seed = 768
+    ctx = test_randomization_context(seed=seed)
+    for i in range(num_tests):
+        rng = random.Random(seed + i)
+        random_value = ctx(rng, seed + i)
+        print(f"{i}: {random_value}")

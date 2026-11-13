@@ -1,0 +1,122 @@
+name: macos
+
+on:
+  push:
+    branches-ignore:
+      - 'dependabot/**'
+  pull_request:
+
+concurrency:
+  group: ${{ github.ref }}-${{ github.head_ref }}-macos
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check_changes:
+    uses: ./.github/workflows/check_changes.yml
+
+  # Build libamrex and all tests
+  tests-macos-universal-nompi:
+    name: AppleClang Universal w/o MPI [tests-universal]
+    runs-on: macos-latest
+    needs: check_changes
+    if: needs.check_changes.outputs.has_non_docs_changes == 'true'
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - name: Dependencies
+      run: .github/workflows/dependencies/dependencies_mac.sh
+    - name: Set Up Cache
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/Library/Caches/ccache
+        key: ccache-${{ github.workflow }}-${{ github.job }}-git-${{ github.sha }}
+        restore-keys: |
+             ccache-${{ github.workflow }}-${{ github.job }}-git-
+    - name: Build & Install
+      env:
+        # build universal binaries for M1 "Apple Silicon" and Intel CPUs
+        CMAKE_OSX_ARCHITECTURES: "arm64;x86_64"
+        CXXFLAGS: "-fno-operator-names -Werror -Wall -Wextra -Wpedantic -Wnull-dereference -Wfloat-conversion -Wshadow -Woverloaded-virtual -Wextra-semi -Wunreachable-code -Wnon-virtual-dtor"
+      run: |
+        export CCACHE_COMPRESS=1
+        export CCACHE_COMPRESSLEVEL=10
+        export CCACHE_MAXSIZE=50M
+        export CCACHE_SLOPPINESS=time_macros
+        ccache -z
+        ccache --version
+
+        cmake -S . -B build             \
+            -DCMAKE_CXX_STANDARD=20     \
+            -DBUILD_SHARED_LIBS=ON      \
+            -DCMAKE_BUILD_TYPE=Release  \
+            -DCMAKE_VERBOSE_MAKEFILE=ON \
+            -DAMReX_EB=ON               \
+            -DAMReX_MPI=OFF             \
+            -DAMReX_ENABLE_TESTS=ON     \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+        cmake --build build --parallel 3
+
+        ctest --test-dir build --output-on-failure
+
+        du -hs ~/Library/Caches/ccache
+        ccache -s
+
+  # Build libamrex and all tests
+  tests-macos:
+    name: AppleClang@11.0 GFortran@9.3 [tests]
+    runs-on: macos-latest
+    needs: check_changes
+    if: needs.check_changes.outputs.has_non_docs_changes == 'true'
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - name: Dependencies
+      run: .github/workflows/dependencies/dependencies_mac.sh
+    - name: Set Up Cache
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/Library/Caches/ccache
+        key: ccache-${{ github.workflow }}-${{ github.job }}-git-${{ github.sha }}
+        restore-keys: |
+             ccache-${{ github.workflow }}-${{ github.job }}-git-
+    - name: Build & Install
+      env:
+        CXXFLAGS: "-fno-operator-names -Werror -Wall -Wextra -Wpedantic -Wnull-dereference -Wfloat-conversion -Wshadow -Woverloaded-virtual -Wextra-semi -Wunreachable-code -Wnon-virtual-dtor -O1"
+      run: |
+        export CCACHE_COMPRESS=1
+        export CCACHE_COMPRESSLEVEL=10
+        export CCACHE_MAXSIZE=160M
+        export CCACHE_SLOPPINESS=time_macros
+        ccache -z
+        ccache --version
+
+        cmake -S . -B build             \
+            -DCMAKE_CXX_STANDARD=20     \
+            -DCMAKE_BUILD_TYPE=Debug    \
+            -DCMAKE_VERBOSE_MAKEFILE=ON \
+            -DAMReX_EB=ON               \
+            -DAMReX_ENABLE_TESTS=ON     \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+        cmake --build build --parallel 3
+        cmake --build build --target install
+
+        ctest --test-dir build --output-on-failure
+
+        du -hs ~/Library/Caches/ccache
+        ccache -s
+
+    # Publish this configuration to https://my.cdash.org/index.php?project=AMReX
+    # Only on pushes: pull requests from forks get no secrets, and per-PR
+    # submissions would swamp the dashboard. Runs even when the tests failed
+    # so that failures reach the dashboard, and never changes the job status.
+    - name: Submit to CDash
+      if: ${{ !cancelled() && github.event_name == 'push' && github.repository == 'AMReX-Codes/amrex' }}
+      continue-on-error: true
+      env:
+        CDASH_SOURCE_DIR: ${{ github.workspace }}
+        CDASH_BINARY_DIR: ${{ github.workspace }}/build
+        CDASH_BUILD_NAME: macos-appleclang-mpi
+        CDASH_SITE: github-actions
+        CDASH_AUTH_TOKEN: ${{ secrets.CDASH_AUTH_TOKEN }}
+      run: ctest -S ${{ github.workspace }}/Tools/CTest/submit.cmake

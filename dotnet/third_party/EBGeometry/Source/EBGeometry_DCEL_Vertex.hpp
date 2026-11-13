@@ -1,0 +1,388 @@
+// SPDX-FileCopyrightText: 2022 Robert Marskar <robert.marskar@sintef.no>
+//
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+/**
+ * @file   EBGeometry_DCEL_Vertex.hpp
+ * @brief  Declaration of a vertex class for use in DCEL descriptions of polygon
+ * tessellations.
+ * @author Robert Marskar
+ */
+
+#ifndef EBGEOMETRY_DCEL_VERTEX_HPP
+#define EBGEOMETRY_DCEL_VERTEX_HPP
+
+// Std includes
+#include <cmath>
+#include <cstdint>
+#include <type_traits>
+#include <vector>
+
+// Our includes
+#include "EBGeometry_DCEL.hpp"
+#include "EBGeometry_DCEL_Face.hpp"
+#include "EBGeometry_GPU.hpp"
+#include "EBGeometry_Math.hpp"
+#include "EBGeometry_Vec.hpp"
+
+namespace EBGeometry {
+
+namespace DCEL {
+
+/**
+ * @brief Class which represents a vertex node in a doubly-connected edge list
+ * (DCEL).
+ * @details This class is used in DCEL functionality which stores polygonal
+ * surfaces in a mesh. The VertexT class has a position, a normal vector, and the
+ * index of one of the outgoing edges from the vertex.
+ * @note The normal vector is outgoing, i.e. a point x is "outside" the vertex if
+ * the dot product between n and (x - x0) is positive.
+ * @note m_outgoingEdge is an index into the owning DCEL::MeshT's own edge array,
+ * resolved by passing that mesh to the accessors below (see EdgeT for why
+ * indices rather than pointers are used). It is the sole topology this class
+ * stores: which faces touch this vertex is not cached here. Every member is a
+ * plain value (Vec3, uint32_t), so VertexT itself is trivially copyable. A vertex's
+ * id is its index in the mesh's vertex array.
+ * computeVertexNormalAngleWeighted() takes the touching-faces list as an explicit
+ * parameter instead: MeshT::reconcileVertices()
+ * builds it transiently by walking every face's own boundary loop (no pair edges
+ * needed, so this works even on a non-watertight/"dirty" mesh), and discards it
+ * once normals are computed. m_outgoingEdge itself is unrelated to this -- it is
+ * not read by the normal computation -- and remains purely a convenience for
+ * callers who want O(1) access to some edge leaving this vertex.
+ * @note Every method that resolves purely through plain-value members and an
+ * explicitly-supplied Mesh& (getPosition/getNormal/getOutgoingEdgeIndex/
+ * getOutgoingEdge, define, setPosition/setNormal/setEdge,
+ * normalizeNormalVector, flipNormal, signedDistance, unsignedDistance2) is annotated EBGEOMETRY_HOST_DEVICE. computeVertexNormalAngleWeighted()
+ * takes a std::vector<uint32_t>& and aborts with a message on a malformed face, so it remains
+ * EBGEOMETRY_HOST.
+ * @tparam T    Floating-point precision.
+ */
+template <class T>
+class VertexT
+{
+  static_assert(std::is_floating_point_v<T>, "VertexT<T>: T must be a floating-point type");
+
+public:
+  /**
+   * @brief Alias for vector type
+   */
+  using Vec3 = Vec3T<T>;
+
+  /**
+   * @brief Alias for vertex type
+   */
+  using Vertex = VertexT<T>;
+
+  /**
+   * @brief Alias for edge type
+   */
+  using Edge = EdgeT<T>;
+
+  /**
+   * @brief Alias for face type
+   */
+  using Face = FaceT<T>;
+
+  /**
+   * @brief Alias for mesh type
+   */
+  using Mesh = MeshT<T>;
+
+  /**
+   * @brief Alias for edge iterator
+   */
+  using EdgeIterator = EdgeIteratorT<T>;
+
+  /**
+   * @brief Default constructor.
+   * @details Defaulted: the position and normal vectors are zero and the outgoing edge index is the
+   * unset sentinel, from their member initializers (see m_outgoingEdge).
+   */
+  VertexT() = default;
+
+  /**
+   * @brief Partial constructor.
+   * @param[in] a_position Vertex position
+   * @details This initializes the position to a_position and the normal vector
+   * to the zero vector.
+   */
+  EBGEOMETRY_HOST_DEVICE
+  VertexT(const Vec3& a_position);
+
+  /**
+   * @brief Constructor.
+   * @param[in] a_position    Vertex position
+   * @param[in] a_normal Vertex normal vector
+   * @details This initializes the position to a_position and the normal vector
+   * to a_normal.
+   */
+  EBGEOMETRY_HOST_DEVICE
+  VertexT(const Vec3& a_position, const Vec3& a_normal);
+
+  /**
+   * @brief Copy constructor.
+   * @param[in] a_otherVertex Other vertex.
+   * @details Defaulted memberwise copy of every member -- position, normal vector and outgoing edge
+   * index. This is what lets VertexT be trivially copyable:
+   * `std::is_trivially_copyable` requires the copy constructor to be the implicit/defaulted one, so
+   * a user-provided body -- even one that does nothing but a plain memberwise copy -- would
+   * disqualify it. operator=(const Vertex&) has identical semantics.
+   */
+  VertexT(const Vertex& a_otherVertex) = default;
+
+  /**
+   * @brief Move constructor.
+   * @details Defaulted memberwise move; equivalent to the copy constructor since every member is a
+   * plain value.
+   * @param[in, out] a_otherVertex Other vertex.
+   */
+  VertexT(Vertex&& a_otherVertex) = default;
+
+  /**
+   * @brief Destructor (does nothing)
+   */
+  ~VertexT() = default;
+
+  /**
+   * @brief Copy assignment operator.
+   * @details Defaulted memberwise copy; see the copy constructor's documentation.
+   * @param[in] a_otherVertex Other vertex.
+   * @return Reference to (*this).
+   */
+  Vertex&
+  operator=(const Vertex& a_otherVertex) = default;
+
+  /**
+   * @brief Move assignment operator.
+   * @details Defaulted memberwise move; equivalent to copy assignment since every member is a
+   * plain value (see the copy constructor for why it must stay defaulted).
+   * @param[in, out] a_otherVertex Other vertex.
+   * @return Reference to (*this).
+   */
+  Vertex&
+  operator=(Vertex&& a_otherVertex) = default;
+
+  /**
+   * @brief Define function
+   * @param[in] a_position    Vertex position
+   * @param[in] a_edgeIndex   Index of the outgoing edge in the owning mesh's edge array, or
+   * UINT32_MAX if not yet wired into a mesh.
+   * @param[in] a_normal Vertex normal vector
+   * @details This sets the position, normal vector, and outgoing edge index.
+   */
+  EBGEOMETRY_HOST_DEVICE
+  inline void
+  define(const Vec3& a_position, const uint32_t a_edgeIndex, const Vec3& a_normal) noexcept;
+
+  /**
+   * @brief Set the vertex position
+   * @param[in] a_position Vertex position
+   */
+  EBGEOMETRY_HOST_DEVICE
+  inline void
+  setPosition(const Vec3& a_position) noexcept;
+
+  /**
+   * @brief Set the vertex normal vector
+   * @param[in] a_normal Vertex normal vector
+   */
+  EBGEOMETRY_HOST_DEVICE
+  inline void
+  setNormal(const Vec3& a_normal) noexcept;
+
+  /**
+   * @brief Set the index of the outgoing edge.
+   * @param[in] a_edgeIndex Index of an outgoing edge in the owning mesh's edge array, or
+   * UINT32_MAX to mark it unset.
+   */
+  EBGEOMETRY_HOST_DEVICE
+  inline void
+  setEdge(const uint32_t a_edgeIndex) noexcept;
+
+  /**
+   * @brief Normalize the normal vector, ensuring its length is 1
+   * @details The current normal must not be (near-)zero-length; a zero-length normal cannot be
+   * normalized and is left unchanged (a no-op) rather than dividing by zero.
+   */
+  EBGEOMETRY_HOST_DEVICE
+  inline void
+  normalizeNormalVector() noexcept;
+
+  /**
+   * @brief Compute the vertex normal, using the pseudonormal algorithm which
+   * weights the normal with the subtended angle to each connected face.
+   * @param[in] a_thisVertexIndex This vertex's own index in the owning mesh's vertex array, used to
+   * identify which of a face's vertices is "this" one while walking that face's boundary.
+   * @param[in] a_faceIndices Indices, into the owning mesh's face array, of every face touching
+   * this vertex. Not cached anywhere -- callers (see MeshT::reconcileVertices()) discover this by
+   * walking each candidate face's own boundary loop, which needs no pair edges and so works
+   * regardless of whether the mesh is watertight.
+   * @param[in] a_mesh Owning mesh, used to resolve a_faceIndices and a_thisVertexIndex.
+   * @note This computes the normal vector using the pseudonormal algorithm from
+   * Baerentzen and Aanes in "Signed distance computation using the angle
+   * weighted pseudonormal" (DOI: 10.1109/TVCG.2005.49).
+   * @note Every face in a_faceIndices with a non-zero normal must visit this vertex exactly once,
+   * and the vertex and its two neighbors on that face must have distinct positions. A violation
+   * aborts with a message in every build, rather than reading out of bounds or dividing by zero.
+   */
+  EBGEOMETRY_HOST
+  inline void
+  computeVertexNormalAngleWeighted(const uint32_t               a_thisVertexIndex,
+                                   const std::vector<uint32_t>& a_faceIndices,
+                                   const Mesh&                  a_mesh);
+
+  /**
+   * @brief Flip the normal vector
+   */
+  EBGEOMETRY_HOST_DEVICE
+  inline void
+  flipNormal() noexcept;
+
+  /**
+   * @brief Return modifiable vertex position.
+   * @return Reference to m_position.
+   */
+  [[nodiscard]] EBGEOMETRY_HOST_DEVICE
+  inline Vec3T<T>&
+  getPosition() noexcept;
+
+  /**
+   * @brief Return immutable vertex position.
+   * @return Const reference to m_position.
+   */
+  [[nodiscard]] EBGEOMETRY_HOST_DEVICE
+  inline const Vec3T<T>&
+  getPosition() const noexcept;
+
+  /**
+   * @brief Return modifiable vertex normal vector.
+   * @return Reference to m_normal.
+   */
+  [[nodiscard]] EBGEOMETRY_HOST_DEVICE
+  inline Vec3T<T>&
+  getNormal() noexcept;
+
+  /**
+   * @brief Return immutable vertex normal vector.
+   * @return Const reference to m_normal.
+   */
+  [[nodiscard]] EBGEOMETRY_HOST_DEVICE
+  inline const Vec3T<T>&
+  getNormal() const noexcept;
+
+  /**
+   * @brief Get the index of the outgoing edge.
+   * @return Index of the outgoing edge in the owning mesh's edge array, or UINT32_MAX if unset.
+   */
+  [[nodiscard]] EBGEOMETRY_HOST_DEVICE
+  inline uint32_t
+  getOutgoingEdgeIndex() const noexcept;
+
+  /**
+   * @brief Get the outgoing edge.
+   * @param[in] a_mesh Owning mesh, used to resolve the outgoing edge index.
+   * @return Reference to the outgoing edge. m_outgoingEdge must be set (see getOutgoingEdgeIndex()).
+   */
+  [[nodiscard]] EBGEOMETRY_HOST_DEVICE
+  inline Edge&
+  getOutgoingEdge(Mesh& a_mesh) noexcept;
+
+  /**
+   * @brief Get the outgoing edge (const overload).
+   * @param[in] a_mesh Owning mesh, used to resolve the outgoing edge index.
+   * @return Const reference to the outgoing edge. m_outgoingEdge must be set (see
+   * getOutgoingEdgeIndex()).
+   */
+  [[nodiscard]] EBGEOMETRY_HOST_DEVICE
+  inline const Edge&
+  getOutgoingEdge(const Mesh& a_mesh) const noexcept;
+
+  /**
+   * @brief Get the signed distance to this vertex
+   * @param[in] a_x0 Position in space.
+   * @return The returned distance is |a_x0 - m_position| and the sign is given
+   * by the sign of m_normal.dot(a_x0 - m_position); a dot product of zero gives a negative sign.
+   */
+  [[nodiscard]] EBGEOMETRY_HOST_DEVICE
+  inline T
+  signedDistance(const Vec3& a_x0) const noexcept;
+
+  /**
+   * @brief Get the squared unsigned distance to this vertex.
+   * @details This is faster to compute than signedDistance, and might be
+   * preferred for some algorithms.
+   * @param[in] a_x0 Query position.
+   * @return Squared Euclidean distance |a_x0 - m_position|^2.
+   */
+  [[nodiscard]] EBGEOMETRY_HOST_DEVICE
+  inline T
+  unsignedDistance2(const Vec3& a_x0) const noexcept;
+
+protected:
+  /**
+   * @brief Index of an outgoing edge from this vertex.
+   * @details Index into the owning DCEL::MeshT's edge array, or UINT32_MAX if unset. Not read by
+   * computeVertexNormalAngleWeighted(), which takes the touching faces
+   * as an explicit list; see the class notes.
+   */
+  uint32_t m_outgoingEdge = UINT32_MAX;
+
+  /**
+   * @brief Vertex position
+   */
+  Vec3 m_position = Vec3::zeros();
+
+  /**
+   * @brief Vertex normal vector
+   */
+  Vec3 m_normal = Vec3::zeros();
+};
+
+static_assert(std::is_trivially_copyable_v<VertexT<float>>, "VertexT<float> must be trivially copyable");
+static_assert(std::is_trivially_copyable_v<VertexT<double>>, "VertexT<double> must be trivially copyable");
+
+/**
+ * @brief Helpers shared by VertexT::computeVertexNormalAngleWeighted() and DCEL::reconcile().
+ * @details Internal; not part of the public API.
+ */
+namespace VertexDetail {
+
+/**
+ * @brief One face's term in a vertex's angle-weighted pseudonormal: the face's normal weighted by the angle
+ * the face subtends at the vertex.
+ * @details The host's reconcile and DCEL::reconcile() both take their terms from here, so that their
+ * arithmetic cannot drift apart. The positions must be distinct.
+ * @tparam T Floating-point precision.
+ * @param[in] a_x0     The vertex's position.
+ * @param[in] a_x1     The position of the vertex before it on the face.
+ * @param[in] a_x2     The position of the vertex after it on the face.
+ * @param[in] a_normal The face's normal.
+ * @return The angle at @p a_x0 between the edges to @p a_x1 and @p a_x2, times @p a_normal.
+ */
+template <class T>
+EBGEOMETRY_HOST_DEVICE
+inline Vec3T<T>
+angleWeightedTerm(const Vec3T<T>& a_x0, const Vec3T<T>& a_x1, const Vec3T<T>& a_x2, const Vec3T<T>& a_normal) noexcept
+{
+  Vec3T<T> v1 = a_x1 - a_x0;
+  Vec3T<T> v2 = a_x2 - a_x0;
+
+  v1 = v1 / v1.length();
+  v2 = v2 / v2.length();
+
+  // Clamp to [-1,1] to guard against std::acos(NaN) from floating-point rounding.
+  const T alpha = std::acos(Math::clamp(v1.dot(v2), T(-1), T(1)));
+
+  return alpha * a_normal;
+}
+
+} // namespace VertexDetail
+
+} // namespace DCEL
+
+} // namespace EBGeometry
+
+#include "EBGeometry_DCEL_VertexImplem.hpp"
+
+#endif

@@ -1,0 +1,43 @@
+# Vendored third-party sources are kept byte-for-byte as upstream ships them.
+# The CAKE kernel bodies are generated exports pinned by their SHA256SUMS; the
+# first-party files next to them (fe_*, __init__.py, UPSTREAM.md) stay checked.
+exclude: '^(include/cudnn_frontend/thirdparty/|python/cudnn/moe_ep/_megamoe_backend/cutedsl_src/|python/cudnn/linear_attention/cake/kernels/(?!fe_|__init__|UPSTREAM))'
+
+repos:
+-   repo: https://github.com/pre-commit/mirrors-clang-format
+    rev: v21.1.6
+    hooks:
+    -   id: clang-format
+        types_or: [c++, c, cuda]
+-   repo: https://github.com/psf/black-pre-commit-mirror
+    rev: 26.3.1
+    hooks:
+    -   id: black
+        name: black
+        description: "Black: The uncompromising Python code formatter"
+        entry: black
+        language: python
+        minimum_pre_commit_version: 2.9.2
+        require_serial: true
+        types_or: [python, pyi]
+        args: ["--line-length", "160", "--fast"]
+    -   id: black-jupyter
+        name: black-jupyter
+        description:
+            "Black: The uncompromising Python code formatter (with Jupyter Notebook support)"
+        entry: black
+        language: python
+        minimum_pre_commit_version: 2.9.2
+        require_serial: true
+        types_or: [python, pyi, jupyter]
+        additional_dependencies: [".[jupyter]"]
+        args: ["--line-length", "160"]
+-   repo: local
+    hooks:
+    -   id: spdx-license-header
+        name: SPDX license header
+        description: "Every first-party source file carries a commented SPDX-License-Identifier line with a non-empty identifier"
+        language: pygrep
+        entry: '^\s*(?:#|//|\*|/\*)\s*SPDX-License-Identifier:\s*\S+'
+        args: [--negate]
+        types_or: [c++, c, cuda, python]

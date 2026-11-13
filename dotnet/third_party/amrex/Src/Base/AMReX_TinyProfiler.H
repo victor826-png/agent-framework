@@ -1,0 +1,217 @@
+#ifndef AMREX_TINY_PROFILER_H_
+#define AMREX_TINY_PROFILER_H_
+#include <AMReX_Config.H>
+
+#include <AMReX_INT.H>
+#include <AMReX_REAL.H>
+
+#include <array>
+#include <deque>
+#include <iosfwd>
+#include <limits>
+#include <map>
+#include <string>
+#include <tuple>
+#include <utility>
+#include <vector>
+
+namespace amrex {
+
+struct MemStat
+{
+    Long nalloc = 0;        //!< number of allocations
+    Long nfree = 0;         //!< number of frees
+    Long currentmem = 0;    //!< amount of currently used memory in bytes
+    double avgmem = 0.;     //!< memory used (bytes) times time in use (seconds)
+    Long maxmem = 0;        //!< running maximum of currentmem
+};
+
+//! A simple profiler that returns basic performance information (e.g. min, max, and average running time)
+class TinyProfiler
+{
+public:
+    explicit TinyProfiler (std::string funcname) noexcept;
+    TinyProfiler (std::string funcname, bool start_) noexcept;
+    TinyProfiler (std::string funcname, bool start_, bool gpu_sync_) noexcept;
+    explicit TinyProfiler (const char* funcname) noexcept;
+    TinyProfiler (const char* funcname, bool start_) noexcept;
+    TinyProfiler (const char* funcname, bool start_, bool gpu_sync_) noexcept;
+    ~TinyProfiler ();
+
+    TinyProfiler (TinyProfiler const&) = delete;
+    TinyProfiler (TinyProfiler &&) = delete;
+    TinyProfiler& operator= (TinyProfiler const&) = delete;
+    TinyProfiler& operator= (TinyProfiler &&) = delete;
+
+    void start ();
+    void stop ();
+
+    void memory_start () const noexcept;
+    void memory_stop () const noexcept;
+
+    static MemStat* memory_alloc (std::size_t nbytes,
+                                  std::map<std::string, MemStat>& memstats) noexcept;
+    static void memory_free (std::size_t nbytes, MemStat* stat) noexcept;
+
+    static void Initialize ();
+    static void Finalize (bool bFlushing = false);
+
+    static void MemoryInitialize ();
+    static void MemoryFinalize (bool bFlushing = false);
+
+    static bool RegisterArena (const std::string& memory_name,
+                               std::map<std::string, MemStat>& memstats) noexcept;
+
+    static void DeregisterArena (std::map<std::string, MemStat>& memstats) noexcept;
+
+    static void StartRegion (std::string regname) noexcept;
+    static void StartRegion (std::string regname, bool gpu_sync) noexcept;
+    static void StopRegion (const std::string& regname) noexcept;
+
+    static void PrintCallStack (std::ostream& os);
+
+    /**
+     * \brief Name of the innermost active profiler, or nullptr if there is none.
+     *
+     * Unlike PrintCallStack, this can be called from any thread while the
+     * profiled code is running, e.g., from a watchdog or status reporting
+     * thread, and it is async-signal-safe. Profilers started by threads
+     * other than the OpenMP master thread are not tracked.
+     *
+     * The returned string stays valid until amrex::Finalize. Do not call this
+     * concurrently with amrex::Finalize.
+     */
+    [[nodiscard]] static const char* CurrentName () noexcept;
+
+    static void PrintMemoryUsage (std::ostream* os, bool only_local) noexcept;
+
+private:
+    struct Stats
+    {
+        Stats () noexcept  = default;
+        int  depth{0};     //!< recursive depth
+        Long n{0L};         //!< number of calls
+        double dtin{0.0};    //!< inclusive dt
+        double dtex{0.0};    //!< exclusive dt
+    };
+
+    struct TimerKey
+    {
+        std::string name;
+        bool gpu_sync = false;
+
+        bool operator< (TimerKey const& rhs) const noexcept
+        {
+            int const c = name.compare(rhs.name);
+            return c < 0 || (c == 0 && gpu_sync < rhs.gpu_sync);
+        }
+    };
+
+    using RegionStats = std::map<TimerKey, Stats>;
+    using StatsMap = std::map<std::string, RegionStats>;
+
+    //! stats across processes
+    struct ProcStats
+    {
+
+        Long nmin{std::numeric_limits<Long>::max()};
+        Long navg{0L}, nmax{0L};
+        double dtinmin{std::numeric_limits<double>::max()};
+        double dtinavg{0.0}, dtinmax{0.0};
+        double dtexmin{std::numeric_limits<double>::max()};
+        double dtexavg{0.0}, dtexmax{0.0};
+        bool do_print{true};
+        std::string fname;
+        static bool compex (const ProcStats& lhs, const ProcStats& rhs) {
+            return lhs.dtexmax > rhs.dtexmax;
+        }
+        static bool compin (const ProcStats& lhs, const ProcStats& rhs) {
+            return lhs.dtinmax > rhs.dtinmax;
+        }
+    };
+
+    struct MemProcStats
+    {
+        Long nalloc = 0;
+        Long nfree = 0;
+        Long curmem_max = 0;
+        Long avgmem_min = std::numeric_limits<Long>::max();
+        Long avgmem_avg = 0;
+        Long avgmem_max = 0;
+        Long maxmem_min = std::numeric_limits<Long>::max();
+        Long maxmem_avg = 0;
+        Long maxmem_max = 0;
+        std::string fname;
+        static bool compmem (const MemProcStats& lhs, const MemProcStats& rhs) {
+            return lhs.maxmem_max > rhs.maxmem_max;
+        }
+    };
+
+    //! Timer name, and whether it is reported as a synchronized timer
+    TimerKey key;
+    [[maybe_unused]] bool gpu_sync = false; // only used on GPU builds
+    bool in_parallel_region = false;
+    int global_depth = -1;
+    std::vector<Stats*> stats;
+    std::vector<Stats*> selective_stats;
+    //! Value of current_name before this profiler started
+    const char* prev_name = nullptr;
+
+    static std::deque<const TinyProfiler*> mem_stack;
+
+#ifdef AMREX_USE_OMP
+    struct aligned_deque {
+        // align thread-private data to cache lines to prevent false sharing
+        alignas(64) std::deque<const TinyProfiler*> deque;
+    };
+
+    static std::vector<aligned_deque> mem_stack_thread_private;
+#endif
+    static std::vector<std::map<std::string, MemStat>*> all_memstats;
+    static std::vector<std::string> all_memnames;
+
+    static std::vector<std::string> regionstack;
+    static std::vector<std::string> selective_regionstack;
+    static std::vector<std::tuple<std::string,bool,bool> > regionstartstack;
+    //! start time, child time, name, child time shown in the focused report
+    static std::deque<std::tuple<double,double,std::string*,double> > ttstack;
+    static StatsMap statsmap;
+    static StatsMap selective_statsmap;
+    static bool selective_reporting;
+    static double t_init;
+    static double t_memory_init;
+    static bool device_synchronize_around_region;
+    static int n_print_tabs;
+    static int verbose;
+    static double print_threshold;
+    static bool enabled;
+    static bool memprof_enabled;
+    static std::string output_file;
+
+    static std::string const& get_output_file ();
+    static void PrintStats (RegionStats& regstats, double dt_max,
+                            std::ostream* os);
+    static void PrintMemStats (std::map<std::string, MemStat>& memstats,
+                               std::string const& memname, double dt_max,
+                               double t_final, std::ostream* os, bool only_local);
+};
+
+class TinyProfileRegion
+{
+public:
+    explicit TinyProfileRegion (std::string a_regname) noexcept;
+    explicit TinyProfileRegion (const char* a_regname) noexcept;
+    TinyProfileRegion (std::string a_regname, bool gpu_sync) noexcept;
+    TinyProfileRegion (const char* a_regname, bool gpu_sync) noexcept;
+    TinyProfileRegion (TinyProfileRegion const&) = delete;
+    TinyProfileRegion (TinyProfileRegion &&) = delete;
+    TinyProfileRegion& operator= (TinyProfileRegion const&) = delete;
+    TinyProfileRegion& operator= (TinyProfileRegion &&) = delete;
+    ~TinyProfileRegion ();
+private:
+    std::string regname;
+    TinyProfiler tprof;
+};
+
+}
+#endif

@@ -1,0 +1,33 @@
+.. _Chap:GPU:
+
+GPU
+===
+
+In this chapter, we will present GPU support in AMReX.  AMReX targets
+NVIDIA, AMD, and Intel GPUs using their native vendor languages and therefore
+requires CUDA, HIP/ROCm, and SYCL for NVIDIA, AMD, and Intel GPUs, respectively.
+Users can also use OpenMP and/or OpenACC in their applications if desired.
+
+AMReX supports NVIDIA GPUs with compute capability >= 6 and CUDA >= 12.2, and
+AMD GPUs with ROCm >= 6. While SYCL compilers are still under development in
+preparation for Aurora, AMReX officially supports only the latest publicly
+released version of the oneAPI compiler.
+
+For complete details of CUDA, HIP, SYCL, OpenMP, and OpenACC
+languages, see their respective documentation.
+
+Note that this documentation is currently focused on CUDA and HIP. SYCL documentation
+is forthcoming.
+
+Most of the `AMReX Tutorials`_ run on GPUs; the `GpuContainers`_ tutorial covers
+GPU memory, containers and asynchronous copies.
+
+.. _`AMReX Tutorials`: https://amrex-codes.github.io/amrex/tutorials_html/
+
+.. _`GpuContainers`: https://amrex-codes.github.io/amrex/tutorials_html/Base.html#base-gpucontainers
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Contents:
+
+   GPU

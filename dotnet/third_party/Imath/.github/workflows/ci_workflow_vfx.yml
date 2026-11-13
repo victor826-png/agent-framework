@@ -1,0 +1,86 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) Contributors to the OpenEXR Project.
+#
+# GitHub Actions workflow file
+# https://help.github.com/en/actions/reference/workflow-syntax-for-github-actions
+
+name: CI-vfx
+
+#
+# Build against VFX reference platform container images
+#
+
+on:
+  push:
+    paths:
+      - '**'
+      - '!**.md'
+      - '!share/ci/install_manifest/**'
+      - '!.github/workflows/**'
+      - '.github/workflows/ci_workflow_vfx.yml'
+  pull_request:
+    paths:
+      - '**'
+      - '!**.md'
+      - '!share/ci/install_manifest/**'
+      - '!.github/workflows/**'
+      - '.github/workflows/ci_workflow_vfx.yml'
+
+permissions:
+  contents: read
+
+jobs:
+
+  linux:
+
+    name: 'Linux vfx${{ matrix.vfx-cy }}'
+    runs-on: ubuntu-latest
+    container:
+      image: aswf/ci-openexr:${{ matrix.vfx-cy }}
+
+    defaults:
+      run:
+        shell: bash
+
+    strategy:
+      matrix:
+        include:
+
+          - build: 2025
+            vfx-cy: 2025
+
+          - build: 2024
+            vfx-cy: 2024
+
+          - build: 2023
+            vfx-cy: 2023
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Configure
+        run: |
+          BUILD_DIR=$GITHUB_WORKSPACE/_build
+          echo BUILD_DIR="$BUILD_DIR" >> $GITHUB_ENV
+
+          INSTALL_DIR=$GITHUB_WORKSPACE/_install
+          echo INSTALL_DIR="$INSTALL_DIR" >> $GITHUB_ENV
+
+          cmake -B $BUILD_DIR -S $GITHUB_WORKSPACE \
+                -DCMAKE_INSTALL_PREFIX=$INSTALL_DIR \
+                -DCMAKE_VERBOSE_MAKEFILE:BOOL='ON'
+
+      - name: Build
+        run: |
+          cmake --build $BUILD_DIR --target install --config Release
+
+      - name: Test
+        run: |
+          ctest -T Test -C Release \
+            --test-dir $BUILD_DIR \
+            --timeout 7200 \
+            --output-on-failure \
+            -VV
+

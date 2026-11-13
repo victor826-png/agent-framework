@@ -1,0 +1,241 @@
+// SPDX-FileCopyrightText: 2024 Robert Marskar <robert.marskar@sintef.no>
+//
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+/**
+ * @file   EBGeometry_Triangle.hpp
+ * @brief  Declaration of a triangle class with signed distance functionality.
+ * @author Robert Marskar
+ */
+
+#ifndef EBGEOMETRY_TRIANGLE_HPP
+#define EBGEOMETRY_TRIANGLE_HPP
+
+// Std includes
+#include <cstdint>
+#include <type_traits>
+
+// Our includes
+#include "EBGeometry_Array.hpp"
+#include "EBGeometry_Vec.hpp"
+
+namespace EBGeometry {
+
+/**
+ * @brief Triangle class with signed distance functionality.
+ * @details This class represents a planar triangle and has a signed distance functionality. It is
+ * self-contained: it stores all of its own data and holds no external references. The class contains a
+ * triangle face normal vector; three vertex positions, and normal vectors for the three vertices and three edges.
+ *
+ * This class assumes that the vertices are organized with the right-hand rule. I.e., edges are enumerated
+ * as follows:
+ *
+ * Edge 0 points from vertex 0 to vertex 1
+ * Edge 1 points from vertex 1 to vertex 2
+ * Edge 2 points from vertex 2 to vertex 0
+ *
+ * This class can compute its own normal vector from the vertex positions, and the triangle orientation
+ * is then implicitly given by the vertex order.
+ *
+ * To compute the distance from a point to the triangle, one must determine if the point projects to the
+ * "inside" or "outside" of the triangle. If the query point projects to the inside of the triangle, the
+ * distance is simply the projected distance onto the triangle plane. If it projects to the outside of
+ * the triangle, we check the distance against the triangle edges and vertices.
+ *
+ * A triangle also carries a face id: the index of the mesh face it was cut from (see
+ * Parser::readIntoTriangles and TriMeshSDF), or any id the caller assigns. It plays no part in the
+ * distance computation; TriMeshSDF::getClosestFace() reports it.
+ * @tparam T    Floating-point precision.
+ */
+template <class T>
+class Triangle
+{
+  static_assert(std::is_floating_point_v<T>, "T must be a floating-point type");
+
+public:
+  /**
+   * @brief Alias for 2D vector type.
+   */
+  using Vec2 = Vec2T<T>;
+
+  /**
+   * @brief Alias for 3D vector type.
+   */
+  using Vec3 = Vec3T<T>;
+
+  /**
+   * @brief Default constructor. Does not put the triangle in a usable state.
+   */
+  Triangle() noexcept = default;
+
+  /**
+   * @brief Copy constructor.
+   * @param[in] a_otherTriangle Other triangle.
+   */
+  Triangle(const Triangle& a_otherTriangle) noexcept = default;
+
+  /**
+   * @brief Move constructor.
+   * @param[in, out] a_otherTriangle Other triangle.
+   */
+  Triangle(Triangle&& a_otherTriangle) noexcept = default;
+
+  /**
+   * @brief Full constructor.
+   * @param[in] a_vertexPositions Triangle vertex positions.
+   */
+  Triangle(const Array<Vec3, 3>& a_vertexPositions) noexcept;
+
+  /**
+   * @brief Destructor (does nothing).
+   */
+  ~Triangle() noexcept = default;
+
+  /**
+   * @brief Copy assignment.
+   * @param[in] a_otherTriangle Other triangle.
+   * @return Reference to (*this).
+   */
+  Triangle&
+  operator=(const Triangle& a_otherTriangle) noexcept = default;
+
+  /**
+   * @brief Move assignment.
+   * @param[in, out] a_otherTriangle Other triangle.
+   * @return Reference to (*this).
+   */
+  Triangle&
+  operator=(Triangle&& a_otherTriangle) noexcept = default;
+
+  /**
+   * @brief Set the triangle normal vector.
+   * @param[in] a_normal Normal vector. Must be finite and unit length.
+   * @note The input normal should be consistent with the vertex ordering.
+   */
+  void
+  setNormal(const Vec3& a_normal) noexcept;
+
+  /**
+   * @brief Set the triangle vertex positions
+   * @details Also recomputes the triangle face normal from the new vertex positions (see
+   * computeNormal). If the three vertices are collinear or coincident the normal is set to zero:
+   * such a triangle has no interior, and its signed distance is not meaningful.
+   * @param[in] a_vertexPositions Vertex positions. Each component must be finite.
+   */
+  void
+  setVertexPositions(const Array<Vec3, 3>& a_vertexPositions) noexcept;
+
+  /**
+   * @brief Set the triangle vertex normals
+   * @param[in] a_vertexNormals Vertex normals. Each must be finite and unit length, or zero for a vertex
+   * on a fold (a mesh loaded with Parser::OnDefect::Warn can have one).
+   */
+  void
+  setVertexNormals(const Array<Vec3, 3>& a_vertexNormals) noexcept;
+
+  /**
+   * @brief Set the triangle edge normals
+   * @param[in] a_edgeNormals Edge normals. Each must be finite and unit length, or zero for an edge on
+   * a fold (a mesh loaded with Parser::OnDefect::Warn can have one).
+   */
+  void
+  setEdgeNormals(const Array<Vec3, 3>& a_edgeNormals) noexcept;
+
+  /**
+   * @brief Set the face id.
+   * @param[in] a_faceId Id of the face this triangle belongs to.
+   */
+  void
+  setFaceId(const uint32_t a_faceId) noexcept;
+
+  /**
+   * @brief Compute the triangle normal vector.
+   * @details This computes the normal vector from two of the triangle edges, using the
+   * right-hand rule and vertex ordering to infer the normal vector. A zero-area triangle (collinear
+   * or coincident vertices) gets a zero normal.
+   */
+  void
+  computeNormal() noexcept;
+
+  /**
+   * @brief Get the triangle normal vector.
+   * @details Const-only: mutating this in place would desynchronize it from the vertex
+   * positions it was derived from. Use setNormal or setVertexPositions instead.
+   * @return m_triangleNormal
+   */
+  [[nodiscard]] const Vec3&
+  getNormal() const noexcept;
+
+  /**
+   * @brief Get the vertex positions
+   * @details Const-only: mutating positions in place would leave m_triangleNormal stale.
+   * Use setVertexPositions instead.
+   * @return m_vertexPositions
+   */
+  [[nodiscard]] const Array<Vec3, 3>&
+  getVertexPositions() const noexcept;
+
+  /**
+   * @brief Get the vertex normals
+   * @details Const-only; use setVertexNormals to update.
+   * @return m_vertexNormals
+   */
+  [[nodiscard]] const Array<Vec3, 3>&
+  getVertexNormals() const noexcept;
+
+  /**
+   * @brief Get the edge normals
+   * @details Const-only; use setEdgeNormals to update.
+   * @return m_edgeNormals
+   */
+  [[nodiscard]] const Array<Vec3, 3>&
+  getEdgeNormals() const noexcept;
+
+  /**
+   * @brief Get the face id.
+   * @return m_faceId
+   */
+  [[nodiscard]] uint32_t
+  getFaceId() const noexcept;
+
+  /**
+   * @brief Compute the signed distance from the input point x to the triangle.
+   * @details Requires the triangle to be fully initialized with a non-degenerate (non-collinear)
+   * set of vertex positions; see setVertexPositions.
+   * @param[in] a_point Query point. Must be finite.
+   * @return Signed distance; negative inside, positive outside.
+   */
+  [[nodiscard]] T
+  signedDistance(const Vec3& a_point) const noexcept;
+
+protected:
+  /**
+   * @brief Triangle face normal
+   */
+  Vec3 m_triangleNormal = Vec3::max();
+
+  /**
+   * @brief Triangle vertex positions
+   */
+  Array<Vec3, 3> m_vertexPositions{Vec3::max(), Vec3::max(), Vec3::max()};
+
+  /**
+   * @brief Triangle vertex normals
+   */
+  Array<Vec3, 3> m_vertexNormals{Vec3::max(), Vec3::max(), Vec3::max()};
+
+  /**
+   * @brief Triangle edge normals
+   */
+  Array<Vec3, 3> m_edgeNormals{Vec3::max(), Vec3::max(), Vec3::max()};
+
+  /**
+   * @brief Id of the face this triangle belongs to, UINT32_MAX if unset.
+   */
+  uint32_t m_faceId = UINT32_MAX;
+};
+} // namespace EBGeometry
+
+#include "EBGeometry_TriangleImplem.hpp" // NOLINT
+
+#endif

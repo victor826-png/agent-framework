@@ -1,0 +1,330 @@
+.. _Chap:ContinuousIntegration:
+
+Continuous integration
+========================
+
+Every pull request, and every push to the branch pull requests merge into (so the merged result is
+checked too), triggers the CI pipeline defined in ``.github/workflows/CI.yml``, on GitHub-hosted
+``ubuntu-24.04`` runners (pinned: ``ubuntu-26.04``, which ``ubuntu-latest`` became,
+has no ``clang-14`` and a Python too new for the pinned Sphinx). Together, the jobs check: code formatting
+(``clang-format``) and static analysis (``clang-tidy``, advisory); code correctness and assurance
+(the Catch2 unit-test suite, under multiple compilers, SIMD levels, and both ``float`` and
+``double`` precision; every bundled example built and run via CMake, GNU Make and direct compiler
+invocation, under GCC, Clang, and Intel's ``icpx``; a small consuming project
+that uses EBGeometry through ``add_subdirectory`` and ``find_package``; AddressSanitizer and UndefinedBehaviorSanitizer
+runs of the same test suite; device compiles of the GPU-callable code with HIP and, advisory, CUDA);
+spelling (``codespell``); license and copyright compliance (REUSE); and the project's documentation
+(a warnings-as-errors Doxygen build, the ``check-docs`` rule, and HTML/PDF Sphinx builds, the
+HTML one with warnings as errors). A single aggregator job (``CI-passed``) then gates on all of the
+above so branch-protection rules only need to target one required check.
+
+.. contents:: On this page
+   :local:
+   :depth: 2
+
+Two tiers
+---------
+
+The pipeline runs in two tiers, so that a pull request under development gets its answer quickly:
+
+* A **draft** pull request runs the *fast tier*: one or two cells of each matrix, and no
+  ``Linux-Intel``, ``Examples-GNUMake``, ``Examples-FloatPrecision``, ``Static-analysis`` or ``GPU-CUDA``
+  job; ``GPU-HIP`` builds only its optimized configuration. It takes about eight minutes.
+* A pull request that is **ready for review** (marking it ready runs CI again) and every **push** to
+  that branch run the *full tier*: every job and every matrix cell described below.
+
+The tier is chosen from ``github.event.pull_request.draft``, which is false on a push. Every build and
+test run uses all the runner's cores (four on a public repository's standard runner).
+
+Jobs overview
+---------------
+
+Four *setup* jobs run first with no dependencies -- ``Formatting``, ``Codespell``, ``Reuse``, and
+``Doxygen-check``. Every other job depends on all four of them and runs only once they pass; the
+`Dependency graph`_ below shows the full picture. Each job is described in turn.
+
+Formatting
+~~~~~~~~~~
+
+Runs ``clang-format`` (version 21) over ``Source/`` and ``Examples/`` (matrix over the two
+directories) via `jidicula/clang-format-action
+<https://github.com/jidicula/clang-format-action>`_. The PR is blocked if any file differs from the
+formatted output.
+
+Codespell
+~~~~~~~~~
+
+Runs the ``codespell`` pre-commit hook over the files it is configured for: ``Source/``,
+``Docs/``, ``Examples/``, ``Tests/`` (except the mesh files in ``Examples/data/`` and ``Tests/data/``),
+``Integrations/``, ``Scripts/``, ``.github/``, and the top-level text files.
+
+Reuse
+~~~~~
+
+Runs the ``reuse`` pre-commit hook (REUSE license/copyright header compliance) over every tracked
+file.
+
+Doxygen-check
+~~~~~~~~~~~~~
+
+Runs the ``doxygen-check`` pre-commit hook, which builds the Doxygen API reference from
+``Docs/doxygen.conf`` with warnings treated as errors, and the ``check-docs`` and
+``check-device-math`` hooks (see
+`Running CI checks locally with pre-commit`_ below).
+
+Static-analysis
+~~~~~~~~~~~~~~~
+
+Runs ``clang-tidy-18`` (via ``run-clang-tidy-18``) over every ``Tests/*.cpp`` and ``Examples/*.cpp``
+translation unit, using a compile-command database exported from the ``debug`` preset built with
+``clang++-14``. Marked ``continue-on-error: true`` (there is a known review backlog), so it is
+advisory and does not gate ``CI-passed``. Full tier only.
+
+The example lanes below run every example: every folder under :file:`Examples/` with a
+``main.cpp``. The folders are the only list of examples, which ``Examples/CMakeLists.txt`` globs the
+same way, so a new example needs no edit to CI. Each lane builds every example (all but
+``Examples-GNUMake`` with warnings as errors) and runs it to completion. An example checks nothing
+itself (the unit tests verify); a lane fails when an example does not compile, throws, or, in a build
+with assertions, trips an ``EBGEOMETRY_EXPECT()`` check.
+
+Linux-GNU
+~~~~~~~~~
+
+Compiles and runs every example directly with ``g++`` (one job each for ``g++-11`` and
+``g++-12``; ``g++-12`` alone in the fast tier), using ``-std=c++17 -pedantic -Wall -Wextra -Werror`` plus a large set of additional
+diagnostic flags. ``-Wsign-conversion`` stays a warning (``-Wno-error=sign-conversion``), since the
+library does not pass it yet.
+
+Linux-Intel
+~~~~~~~~~~~
+
+Compiles and runs every example with Intel's ``icpx`` compiler, ``-std=c++17 -O0
+-fp-model=precise -Wall -Werror`` plus additional diagnostic flags. Full tier only.
+
+Examples-GNUMake
+~~~~~~~~~~~~~~~~
+
+Builds and runs every example via its own ``GNUmakefile`` (``make run``), with the makefile's
+default flags. Full tier only.
+
+Examples-CMake
+~~~~~~~~~~~~~~
+
+Configures the top-level project with the ``debug`` preset (assertions on, ``double`` precision),
+the unit tests switched off and ``-Werror``, and runs every example via ``ctest --preset examples``.
+The examples follow the project's build type, so they run unoptimized here. This is the path that
+exercises the CMake-driven build with assertions enabled, unlike ``Linux-GNU``/``Linux-Intel`` (raw
+compiler invocation, no assertions) or ``Unit-Tests``/``Sanitizers`` (examples disabled).
+
+Examples-FloatPrecision
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The same as ``Examples-CMake``, but configured with ``-DEBGEOMETRY_PRECISION=float`` (a cache
+variable shared by every example's own ``CMakeLists.txt``). Full tier only.
+
+Viewer-SDL2
+~~~~~~~~~~~
+
+Installs SDL2 and configures the ``debug`` preset with ``-DEBGEOMETRY_VIEWER=SDL2`` and ``-Werror``, the
+only lane that compiles the viewer window (:ref:`Sec:ConfigViewer`). It builds and runs ``TestRender``,
+builds every example that calls ``Render::view()`` and runs them without a display, where ``view()``
+returns at once, and builds them again with ``make VIEWER=SDL2``.
+
+Performance-smoke
+~~~~~~~~~~~~~~~~~
+
+Configures with the ``perf`` preset and ``-Wall -Wextra -Werror``, builds the performance probes under
+``Performance/``, and runs every case at its small ``--smoke`` size (``ctest --preset perf``). This
+checks that the probes still compile and run; it times nothing. The same ``ctest`` run checks that the receipt
+writer keeps a report whole (``Performance/TestReceipt.cmake``). See :ref:`Chap:PerformanceTesting`.
+
+Performance-receipt
+~~~~~~~~~~~~~~~~~~~
+
+On a pull request that is ready for review, checks its performance receipt (``Performance/CheckReceipt.cmake``): the result of
+the full comparison its author ran locally with ``Scripts/run-performance.sh compare --record`` and
+committed. It times nothing, since a shared runner is too noisy to judge performance. It fails when the
+pull request changes the library or the probes and its receipt is missing, measured other code (stale),
+measured an outdated base, or is not green and has no accepted reason; see :ref:`Chap:PerformanceTesting`.
+The result goes into the job summary. On a push or a draft the job does nothing and succeeds (on a
+draft, with a notice), since ``CI-passed`` counts a skipped job as a failure. The HIP lane also compiles the probes for its device; the CUDA lane leaves them to the device receipt.
+
+CMake-consumer
+~~~~~~~~~~~~~~
+
+Builds a small project that uses EBGeometry, once through ``add_subdirectory`` and once through
+``cmake --install`` and ``find_package(EBGeometry)``, and checks that the ``EBGeometry::EBGeometry``
+target imposes no SIMD flags on it (``Scripts/check-cmake-consumer.sh``).
+
+Build-documentation
+~~~~~~~~~~~~~~~~~~~
+
+Installs Doxygen, Graphviz, a LaTeX toolchain, Poppler (for the documentation figure pipeline), and
+Sphinx (with ``sphinx_rtd_theme`` and ``sphinxcontrib-bibtex``); builds the Doxygen API reference;
+renders the documentation figures from their LaTeX/TikZ sources (``Scripts/build-doc-figures.sh``);
+builds the Sphinx HTML documentation with warnings treated as errors (``-W --keep-going``, so a
+broken cross-reference or a missing figure fails the job) and the PDF documentation; uploads the
+result as a workflow artifact.
+
+Unit-Tests
+~~~~~~~~~~
+
+Configures with the ``debug`` preset (examples disabled) across a matrix of compilers
+``{g++-12, clang++-14}`` × SIMD levels ``{none, avx, avx512}``, with
+``-DEBGEOMETRY_TEST_BOTH_PRECISIONS=ON``, and runs ``ctest --preset debug``; the fast tier runs only
+``g++-12`` with ``avx`` and ``clang++-14`` with ``none``. The ``avx512``
+configurations always compile (catching ISA-specific errors in the SIMD-accelerated code paths) but
+only actually run on a runner whose CPU supports AVX-512F.
+
+Release-Test
+~~~~~~~~~~~~
+
+Configures with the ``release-test`` preset (optimized, AVX, examples and tests both enabled) plus
+``-DEBGEOMETRY_TEST_BOTH_PRECISIONS=ON``, and runs ``ctest --preset release-test`` (the full
+unit-test and example suite).
+
+Sanitizers
+~~~~~~~~~~
+
+Configures with the ``debug-san`` preset (examples disabled) across a matrix of compilers
+``{g++-12, clang++-14}`` × SIMD levels ``{none, avx}``, with ``-DEBGEOMETRY_TEST_BOTH_PRECISIONS=ON``,
+and runs ``ctest --preset debug-san`` under AddressSanitizer and UndefinedBehaviorSanitizer; the fast
+tier runs only ``g++-12`` with ``avx``.
+
+GPU-HIP
+~~~~~~~
+
+Installs a HIP toolchain (``hipcc``, ``clang-17``) and compiles the unit-test files that carry a
+device block in clang's HIP mode, with ``-DEBGEOMETRY_TEST_BOTH_PRECISIONS=ON``, so the
+GPU-callable code must compile for the device. It also compiles the examples
+(``EBGeometry_GPUDeviceExamples``, see :ref:`Sec:ExamplesGPU`) and the performance probes for the
+device, without running them. It builds optimized (Release) and with host SIMD flags (``-mavx -mfma
+-msse4.1``), which catches a SIMD block that is not excluded from device compilation, and device code
+whose compile grows out of hand once HIP inlines every device function, which only an optimized build
+shows; the full tier builds a second time, unoptimized. The runner has no GPU, so the device-tagged tests it then runs skip before launching a
+kernel: the step checks that the binaries start and that the device query is safe, not that device
+code gives correct results. This job is required by ``CI-passed``.
+
+GPU-CUDA
+~~~~~~~~
+
+The same device compile with ``nvcc`` (CUDA 12.5), device examples included, optimized (Release), without
+assertions and without SIMD flags. It does not build the performance probes: the device receipt builds every
+probe for the device on the pull request's final code, and building them here too would double the job's time. Full tier only. CUDA and HIP are separate jobs because they use different
+device compilers and install routes, and run side by side. Marked
+``continue-on-error: true``, because its toolkit install is the least reliable step in the
+workflow, so it is advisory and does not gate ``CI-passed``.
+
+CI-passed
+~~~~~~~~~
+
+Aggregates every job above -- except the advisory ``Static-analysis`` and ``GPU-CUDA`` -- as a single
+required status check. It runs even when one of those jobs fails or is canceled, and fails unless
+every one of them succeeded; a skipped dependency counts as a failure too, since a skipped required
+check would not block a merge, except a full-tier-only job skipped on a draft. Branch-protection rules can target this job instead of each
+individual job.
+
+Dependency graph
+------------------
+
+.. code-block:: text
+
+   Formatting, Codespell, Reuse, Doxygen-check
+    +-- Static-analysis          (advisory; not required by CI-passed)
+    +-- Linux-GNU
+    +-- Linux-Intel
+    +-- Examples-GNUMake
+    +-- Examples-CMake
+    +-- Examples-FloatPrecision
+    +-- Viewer-SDL2
+    +-- Performance-smoke
+    +-- Performance-receipt
+    +-- Build-documentation
+    +-- Unit-Tests
+    +-- Release-Test
+    +-- Sanitizers
+    +-- GPU-CUDA                 (advisory; not required by CI-passed)
+    +-- GPU-HIP
+    +-- CMake-consumer
+         (all of the above except Static-analysis and GPU-CUDA) --> CI-passed
+
+``Formatting``, ``Codespell``, ``Reuse``, and ``Doxygen-check`` themselves have no
+dependencies and run first, in parallel; every other job depends on all four of them.
+
+Package installs and time limits
+----------------------------------
+
+Every job that installs Ubuntu packages does so through ``.github/actions/apt-install``, a small
+composite action that caches the package index and the downloaded ``.deb`` files between runs
+(``actions/cache``). On a cache hit it installs with no network access at all, from the cached
+index and packages, so maintainer scripts still run but neither the index refresh nor the download
+touches a mirror. Ubuntu's mirrors are sometimes slow, or stop answering, for long enough to eat a
+job's whole time limit; with the cache, that can only happen on the first run of a month. If the
+offline install fails (the runner image has moved on, say), the action refreshes the index and
+downloads, with timeouts and retries so a dead mirror cannot hang the job. The cache key holds the
+runner image, the package list and the month, so a new image or a changed list starts a fresh
+cache. The documentation deploy workflow (``docs.yml``) uses the same action. ``Linux-Intel``
+installs Intel's compiler from Intel's own repository and is not cached.
+
+``Build-documentation`` and ``Sanitizers`` have 30-minute limits, which leaves room for a first,
+uncached run on a slow mirror.
+
+Running CI checks locally with ``pre-commit``
+------------------------------------------------
+
+A subset of the CI checks can be reproduced locally before pushing using
+`pre-commit <https://pre-commit.com>`_:
+
+.. code-block:: bash
+
+   pip install pre-commit
+   pre-commit install          # installs the git hook
+   pre-commit run --all-files  # run all hooks on the whole tree
+
+The hooks configured in ``.pre-commit-config.yaml`` include:
+
+* **clang-format** — formats ``Source/`` and ``Examples/`` C/C++ files (default stage; runs on
+  every ``git commit`` once ``pre-commit install`` has been run).
+* **reuse** — REUSE license/copyright header compliance (default stage).
+* **codespell** — typo detection across ``Source/``, ``Docs/``, ``Examples/`` (except
+  ``Examples/data/``), ``Tests/`` (except ``Tests/data/``), ``Integrations/``, ``Scripts/``, ``.github/``, and the top-level text
+  files (default stage).
+* **doxygen-check** — builds Doxygen from ``Docs/doxygen.conf`` (warnings as
+  errors; default stage). It runs whenever a header, ``EBGeometry.hpp``, ``Docs/mainpage.md`` or
+  ``Docs/doxygen.conf`` changes.
+* **clang-tidy** — static analysis over the library headers, via
+  ``Scripts/clang-tidy-check.sh`` (``stages: [manual]``; needs a compile
+  database, so it (re)configures the ``debug`` preset first).
+* **build-tests** — compiles the unit test suite with the ``debug`` preset
+  (``stages: [manual]``), catching template-instantiation errors locally
+  before they show up first in CI.
+* **check-docs** — enforces the ban on ``.. literalinclude::`` in the Sphinx docs
+  (default stage, run whenever a ``Docs/Sphinx/source/*.rst`` file changes; CI's
+  ``Doxygen-check`` job also runs it; see ``Scripts/CheckDocs.py``): it fails if any
+  ``.. literalinclude::`` directive exists anywhere under ``Docs/Sphinx/source/``.
+  A clean run only guarantees the banned directive is absent, not that the
+  surrounding prose still accurately describes the code -- that still needs a
+  manual read-through.
+* **check-device-math** — enforces the device toolchain contract (no ``std::min``/``max``/
+  ``clamp``/``numeric_limits``/``array`` in ``Source/``; see ``Scripts/CheckDeviceMath.py``). Default
+  stage; runs when a ``Source/*.hpp``, a ``Tests/*.[ch]pp`` or the script itself changes.
+* **build-doc-figures** — renders the documentation figures from their
+  LaTeX/TikZ sources under ``Docs/Sphinx/source/_static/`` (``stages: [manual]``;
+  requires ``pdflatex`` and ``pdftoppm`` on ``PATH``; see ``Scripts/build-doc-figures.sh``).
+* **sphinx-build-html** — builds the Sphinx HTML docs in a managed Python virtual
+  environment, with warnings treated as errors (``stages: [manual]``; run with
+  ``pre-commit run sphinx-build-html --hook-stage manual``).
+* **sphinx-build-pdf** — builds the Sphinx PDF docs via ``make latexpdf``
+  (``stages: [manual]``; requires a full LaTeX toolchain — ``texlive-latex-extra``
+  and ``latexmk`` — on ``PATH``; run with
+  ``pre-commit run sphinx-build-pdf --hook-stage manual``).
+
+.. tip::
+
+   The manual-stage hooks above are not run by a plain ``pre-commit run``
+   invocation (they need system LaTeX/Doxygen/CMake tooling and take longer than
+   the default hooks); use the explicit ``--hook-stage manual`` flag (with the
+   specific hook id, or omit it to run all manual-stage hooks) when you want to
+   verify them locally. The ``sphinx-build-*`` hooks render the figures themselves
+   (Sphinx runs ``Scripts/build-doc-figures.sh`` when a build starts, skipping figures
+   that are up to date), so they need no hook to run before them.
