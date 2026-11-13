@@ -1,0 +1,27 @@
+[submodule "dotnet/third_party/TorchSharp"]
+	path = dotnet/third_party/TorchSharp
+	url = https://github.com/dotnet/TorchSharp.git
+[submodule "dotnet/third_party/pytorch"]
+	path = dotnet/third_party/pytorch
+	url = https://github.com/pytorch/pytorch.git
+[submodule "dotnet/third_party/PicoGK"]
+	path = dotnet/third_party/PicoGK
+	url = https://github.com/leap71/PicoGK.git
+[submodule "dotnet/third_party/ShapeKernel"]
+	path = dotnet/third_party/ShapeKernel
+	url = https://github.com/leap71/LEAP71_ShapeKernel.git
+[submodule "dotnet/third_party/HelixHeatX"]
+	path = dotnet/third_party/HelixHeatX
+	url = https://github.com/leap71/LEAP71_HelixHeatX.git
+[submodule "dotnet/third_party/cgal"]
+	path = dotnet/third_party/cgal
+	url = https://github.com/CGAL/cgal.git
+[submodule "dotnet/third_party/EBGeometry"]
+	path = dotnet/third_party/EBGeometry
+	url = https://github.com/rmrsk/EBGeometry.git
+[submodule "dotnet/third_party/AMGX"]
+	path = dotnet/third_party/AMGX
+	url = https://github.com/NVIDIA/AMGX.git
+[submodule "dotnet/third_party/amrex"]
+	path = dotnet/third_party/amrex
+	url = https://github.com/AMReX-Codes/amrex.git
