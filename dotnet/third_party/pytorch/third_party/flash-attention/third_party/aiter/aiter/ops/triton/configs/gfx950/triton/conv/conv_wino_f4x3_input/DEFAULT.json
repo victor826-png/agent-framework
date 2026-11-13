@@ -1,7 +1,0 @@
-{
-    "any": {
-        "BLOCK_C": 64,
-        "num_warps": 4,
-        "num_stages": 1
-    }
-}
