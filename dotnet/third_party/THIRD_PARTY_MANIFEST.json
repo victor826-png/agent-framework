@@ -1,0 +1,362 @@
+{
+  "schema_version": 1,
+  "inventory_scope": "priority",
+  "repository_path": "dotnet/third_party",
+  "snapshot_policy": "Tracked source folders; original upstream Git history is not presumed to be present.",
+  "revision_policy": "upstream_commit is unknown unless an upstream commit is independently verified. No commit SHA is inferred from the snapshot.",
+  "build_policy": "not_verified means no build or test result is claimed by this inventory.",
+  "entries": [
+    {
+      "directory": "TorchSharp",
+      "path": "dotnet/third_party/TorchSharp",
+      "upstream": "https://github.com/dotnet/TorchSharp",
+      "purpose": "PyTorch bindings for .NET",
+      "priority": "P0",
+      "upstream_commit": "unknown",
+      "declared_package_version": "unknown",
+      "version_evidence": "unknown",
+      "license": {
+        "status": "unknown_or_requires_review",
+        "expression": null,
+        "evidence": null
+      },
+      "build_status": "not_verified",
+      "notes": [
+        "License not confirmed at the expected root LICENSE path."
+      ]
+    },
+    {
+      "directory": "PicoGK",
+      "path": "dotnet/third_party/PicoGK",
+      "upstream": "https://github.com/leap71/PicoGK",
+      "purpose": "Geometry kernel",
+      "priority": "P0",
+      "upstream_commit": "unknown",
+      "declared_package_version": "2.3.0",
+      "version_evidence": "PicoGK.csproj: Version property (package metadata)",
+      "license": {
+        "status": "observed_in_snapshot",
+        "expression": "Apache-2.0",
+        "evidence": "dotnet/third_party/PicoGK/PicoGK.csproj: PackageLicenseExpression"
+      },
+      "build_status": "not_verified",
+      "notes": [
+        "PicoGK.csproj declares package version 2.3.0; this is package metadata, not an upstream commit pin."
+      ]
+    },
+    {
+      "directory": "ShapeKernel",
+      "path": "dotnet/third_party/ShapeKernel",
+      "upstream": "https://github.com/leap71/LEAP71_ShapeKernel",
+      "purpose": "Higher-level geometry operations",
+      "priority": "P0",
+      "upstream_commit": "unknown",
+      "declared_package_version": "unknown",
+      "version_evidence": "unknown",
+      "license": {
+        "status": "observed_in_snapshot",
+        "expression": "Apache-2.0",
+        "evidence": "dotnet/third_party/ShapeKernel/LICENSE"
+      },
+      "build_status": "not_verified",
+      "notes": []
+    },
+    {
+      "directory": "HelixHeatX",
+      "path": "dotnet/third_party/HelixHeatX",
+      "upstream": "https://github.com/leap71/LEAP71_HelixHeatX",
+      "purpose": "Geometry and thermal-design example",
+      "priority": "P1",
+      "upstream_commit": "unknown",
+      "declared_package_version": "unknown",
+      "version_evidence": "unknown",
+      "license": {
+        "status": "unknown_or_requires_review",
+        "expression": null,
+        "evidence": null
+      },
+      "build_status": "not_verified",
+      "notes": [
+        "Example project; not treated as a general-purpose solver."
+      ]
+    },
+    {
+      "directory": "cgal",
+      "path": "dotnet/third_party/cgal",
+      "upstream": "https://github.com/CGAL/cgal",
+      "purpose": "Computational geometry",
+      "priority": "P0",
+      "upstream_commit": "unknown",
+      "declared_package_version": "unknown",
+      "version_evidence": "unknown",
+      "license": {
+        "status": "unknown_or_requires_review",
+        "expression": null,
+        "evidence": null
+      },
+      "build_status": "not_verified",
+      "notes": [
+        "Component-level licensing must be reviewed; no single license expression is asserted here."
+      ]
+    },
+    {
+      "directory": "EBGeometry",
+      "path": "dotnet/third_party/EBGeometry",
+      "upstream": "https://github.com/rmrsk/EBGeometry",
+      "purpose": "Header-only implicit geometry and spatial queries",
+      "priority": "P0",
+      "upstream_commit": "unknown",
+      "declared_package_version": "unknown",
+      "version_evidence": "unknown",
+      "license": {
+        "status": "observed_in_snapshot",
+        "expression": "GPL-3.0 (grant variant not classified)",
+        "evidence": "dotnet/third_party/EBGeometry/LICENSE"
+      },
+      "build_status": "not_verified",
+      "notes": []
+    },
+    {
+      "directory": "AMGX",
+      "path": "dotnet/third_party/AMGX",
+      "upstream": "https://github.com/NVIDIA/AMGX",
+      "purpose": "GPU-accelerated linear solvers",
+      "priority": "P0",
+      "upstream_commit": "unknown",
+      "declared_package_version": "unknown",
+      "version_evidence": "unknown",
+      "license": {
+        "status": "unknown_or_requires_review",
+        "expression": null,
+        "evidence": null
+      },
+      "build_status": "not_verified",
+      "notes": [
+        "License and CUDA/toolchain requirements need separate verification."
+      ]
+    },
+    {
+      "directory": "amrex",
+      "path": "dotnet/third_party/amrex",
+      "upstream": "https://github.com/AMReX-Codes/amrex",
+      "purpose": "Adaptive-mesh scientific computing",
+      "priority": "P0",
+      "upstream_commit": "unknown",
+      "declared_package_version": "unknown",
+      "version_evidence": "unknown",
+      "license": {
+        "status": "observed_in_snapshot",
+        "expression": "BSD-3-Clause",
+        "evidence": "dotnet/third_party/amrex/LICENSE"
+      },
+      "build_status": "not_verified",
+      "notes": []
+    },
+    {
+      "directory": "NanoVDB",
+      "path": "dotnet/third_party/NanoVDB",
+      "upstream": "https://github.com/AcademySoftwareFoundation/openvdb/tree/master/nanovdb",
+      "purpose": "Optimized sparse-volume representation for GPUs",
+      "priority": "P0",
+      "upstream_commit": "unknown",
+      "declared_package_version": "unknown",
+      "version_evidence": "unknown",
+      "license": {
+        "status": "observed_in_snapshot",
+        "expression": "Apache-2.0",
+        "evidence": "dotnet/third_party/NanoVDB/LICENSE"
+      },
+      "build_status": "not_verified",
+      "notes": []
+    },
+    {
+      "directory": "fvdb-core",
+      "path": "dotnet/third_party/fvdb-core",
+      "upstream": "https://github.com/openvdb/fvdb-core",
+      "purpose": "Sparse volumetric operations integrated with PyTorch",
+      "priority": "P0",
+      "upstream_commit": "unknown",
+      "declared_package_version": "unknown",
+      "version_evidence": "unknown",
+      "license": {
+        "status": "observed_in_snapshot",
+        "expression": "Apache-2.0",
+        "evidence": "dotnet/third_party/fvdb-core/LICENSE"
+      },
+      "build_status": "not_verified",
+      "notes": [
+        "Python/PyTorch integration is not a .NET library contract."
+      ]
+    },
+    {
+      "directory": "OpenUSD",
+      "path": "dotnet/third_party/OpenUSD",
+      "upstream": "https://github.com/PixarAnimationStudios/OpenUSD",
+      "purpose": "Scene description, hierarchies, transforms, and geometry",
+      "priority": "P0",
+      "upstream_commit": "unknown",
+      "declared_package_version": "unknown",
+      "version_evidence": "unknown",
+      "license": {
+        "status": "unknown_or_requires_review",
+        "expression": null,
+        "evidence": null
+      },
+      "build_status": "not_verified",
+      "notes": [
+        "License not confirmed at the expected root LICENSE path."
+      ]
+    },
+    {
+      "directory": "Assimp",
+      "path": "dotnet/third_party/Assimp",
+      "upstream": "https://github.com/assimp/assimp",
+      "purpose": "3D asset import and export",
+      "priority": "P1",
+      "upstream_commit": "unknown",
+      "declared_package_version": "unknown",
+      "version_evidence": "unknown",
+      "license": {
+        "status": "unknown_or_requires_review",
+        "expression": null,
+        "evidence": null
+      },
+      "build_status": "not_verified",
+      "notes": []
+    },
+    {
+      "directory": "Imath",
+      "path": "dotnet/third_party/Imath",
+      "upstream": "https://github.com/AcademySoftwareFoundation/Imath",
+      "purpose": "Vector, matrix, and transformation math",
+      "priority": "P1",
+      "upstream_commit": "unknown",
+      "declared_package_version": "unknown",
+      "version_evidence": "unknown",
+      "license": {
+        "status": "unknown_or_requires_review",
+        "expression": null,
+        "evidence": null
+      },
+      "build_status": "not_verified",
+      "notes": []
+    },
+    {
+      "directory": "LEAP71_LatticeLibrary",
+      "path": "dotnet/third_party/LEAP71_LatticeLibrary",
+      "upstream": "https://github.com/leap71/LEAP71_LatticeLibrary",
+      "purpose": "Lattice generation with PicoGK and ShapeKernel",
+      "priority": "P1",
+      "upstream_commit": "unknown",
+      "declared_package_version": "unknown",
+      "version_evidence": "unknown",
+      "license": {
+        "status": "unknown_or_requires_review",
+        "expression": null,
+        "evidence": null
+      },
+      "build_status": "not_verified",
+      "notes": []
+    },
+    {
+      "directory": "LEAP71_RoverWheel",
+      "path": "dotnet/third_party/LEAP71_RoverWheel",
+      "upstream": "https://github.com/leap71/LEAP71_RoverWheel",
+      "purpose": "Multi-layer rover wheel geometry",
+      "priority": "P1",
+      "upstream_commit": "unknown",
+      "declared_package_version": "unknown",
+      "version_evidence": "unknown",
+      "license": {
+        "status": "unknown_or_requires_review",
+        "expression": null,
+        "evidence": null
+      },
+      "build_status": "not_verified",
+      "notes": []
+    },
+    {
+      "directory": "LEAP71_QuasiCrystals",
+      "path": "dotnet/third_party/LEAP71_QuasiCrystals",
+      "upstream": "https://github.com/leap71/LEAP71_QuasiCrystals",
+      "purpose": "Quasi-crystal geometry examples",
+      "priority": "P1",
+      "upstream_commit": "unknown",
+      "declared_package_version": "unknown",
+      "version_evidence": "unknown",
+      "license": {
+        "status": "unknown_or_requires_review",
+        "expression": null,
+        "evidence": null
+      },
+      "build_status": "not_verified",
+      "notes": []
+    },
+    {
+      "directory": "PicoGKRuntime",
+      "path": "dotnet/third_party/PicoGKRuntime",
+      "upstream": "https://github.com/leap71/PicoGKRuntime",
+      "purpose": "C++ runtime for the PicoGK geometry kernel",
+      "priority": "P1",
+      "upstream_commit": "unknown",
+      "declared_package_version": "unknown",
+      "version_evidence": "unknown",
+      "license": {
+        "status": "unknown_or_requires_review",
+        "expression": null,
+        "evidence": null
+      },
+      "build_status": "not_verified",
+      "notes": []
+    },
+    {
+      "directory": "PicoGKInstaller",
+      "path": "dotnet/third_party/PicoGKInstaller",
+      "upstream": "https://github.com/leap71/PicoGKInstaller",
+      "purpose": "Installer for the PicoGK Runtime",
+      "priority": "P1",
+      "upstream_commit": "unknown",
+      "declared_package_version": "unknown",
+      "version_evidence": "unknown",
+      "license": {
+        "status": "unknown_or_requires_review",
+        "expression": null,
+        "evidence": null
+      },
+      "build_status": "not_verified",
+      "notes": []
+    }
+  ],
+  "nested_submodule_declarations": [
+    {
+      "declared_in": "dotnet/third_party/PicoGKInstaller/.gitmodules",
+      "path": "Tools/create-dmg",
+      "upstream": "https://github.com/create-dmg/create-dmg",
+      "materialization": "not_asserted"
+    },
+    {
+      "declared_in": "dotnet/third_party/PicoGKInstaller/.gitmodules",
+      "path": "PicoGK Example/PicoGK",
+      "upstream": "https://github.com/leap71/PicoGK",
+      "materialization": "not_asserted"
+    },
+    {
+      "declared_in": "dotnet/third_party/PicoGKInstaller/.gitmodules",
+      "path": "PicoGK Example/ShapeKernel",
+      "upstream": "https://github.com/leap71/LEAP71_ShapeKernel",
+      "materialization": "not_asserted"
+    },
+    {
+      "declared_in": "dotnet/third_party/PicoGKInstaller/.gitmodules",
+      "path": "PicoGK Example/LatticeLibrary",
+      "upstream": "https://github.com/leap71/LEAP71_LatticeLibrary",
+      "materialization": "not_asserted"
+    },
+    {
+      "declared_in": "dotnet/third_party/PicoGKInstaller/.gitmodules",
+      "path": "PicoGK Example/QuasiCrystals",
+      "upstream": "https://github.com/leap71/LEAP71_QuasiCrystals",
+      "materialization": "not_asserted"
+    }
+  ]
+}
