@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import sys
 from pathlib import Path
 
@@ -66,16 +65,22 @@ def main() -> int:
         errors.append(f"cannot read README {readme_path}: {exc}")
         readme = ""
 
-    tick = chr(96)
-    pattern = r"^\|\s*" + tick + r"([^" + tick + r"]+)" + tick + r"\s*\|"
-    readme_entries = re.findall(pattern, readme, flags=re.MULTILINE)
+    readme_entries = []
+    for line in readme.splitlines():
+        cells = line.split("|")
+        if len(cells) < 2:
+            continue
+        cell = cells[1].strip()
+        if len(cell) >= 2 and cell.startswith("`") and cell.endswith("`"):
+            readme_entries.append(cell[1:-1])
+
     if readme_entries != directories:
         errors.append(
             "README directory table does not match manifest order/content "
             f"(README={readme_entries!r}, manifest={directories!r})"
         )
 
-    if "pytorch" in directories or re.search(r"^\|\s*" + tick + r"pytorch" + tick + r"\s*\|", readme, flags=re.MULTILINE):
+    if "pytorch" in directories or "`pytorch`" in readme:
         errors.append("removed PyTorch snapshot must not appear in the current directory inventory")
 
     if errors:
